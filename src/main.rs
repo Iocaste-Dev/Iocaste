@@ -42,13 +42,13 @@ USAGE:
 
 COMMANDS:
     new <name>            Create a new project (ioc.toml + src/Program.ioc)
-    check [file.ioc]      Check syntax. Without a file, checks every .ioc under ./src
+    check [file.ioc...]   Check syntax, names and types (--syntax-only). Without a file, checks every .ioc under ./src
     ast <file.ioc>        Print the syntax tree      (--ascii: plain characters, --raw: Rust debug dump)
     tokens <file.ioc>     Print the token stream
     version               Show the version
     help                  Show this help
 
-Coming next: type checking (v0.0.3), borrow checking (v0.0.4), `ioc build` / `ioc run` (v0.0.5)."
+Coming next: borrow checking (v0.0.4), `ioc build` / `ioc run` (v0.0.5)."
     );
 }
 
@@ -77,7 +77,9 @@ fn collect_ioc_files(dir: &Path, out: &mut Vec<PathBuf>) {
 // -------------------------------------------------------------- commands
 
 fn cmd_check(args: &[String]) -> i32 {
-    let files: Vec<PathBuf> = if args.is_empty() {
+    let syntax_only = args.iter().any(|a| a == "--syntax-only");
+    let paths: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let files: Vec<PathBuf> = if paths.is_empty() {
         let src = Path::new("src");
         if !src.is_dir() {
             eprintln!("ioc: no `src` folder here. Run inside a project, or pass a file: ioc check <file.ioc>");
@@ -91,31 +93,58 @@ fn cmd_check(args: &[String]) -> i32 {
         }
         v
     } else {
-        args.iter().map(PathBuf::from).collect()
+        paths.iter().map(|p| PathBuf::from(p.as_str())).collect()
     };
 
-    let mut errors = 0;
+    // Phase 1: syntax.
+    let mut sources = Vec::new();
+    let mut asts = Vec::new();
+    let mut syntax_errors = 0;
     for f in &files {
         let src = match read_source(f) {
             Ok(s) => s,
             Err(code) => return code,
         };
         match parser::parse(&src) {
-            Ok(_) => println!("ok      {}", f.display()),
+            Ok(ast) => asts.push(ast),
             Err(d) => {
-                errors += 1;
+                syntax_errors += 1;
                 eprint!("{}", d.render(&f.display().to_string(), &src));
                 eprintln!();
             }
         }
+        sources.push(src);
     }
-    if errors == 0 {
-        println!("\nchecked {} file(s): no syntax errors", files.len());
-        0
-    } else {
-        eprintln!("checked {} file(s): {} with errors", files.len(), errors);
-        1
+    if syntax_errors > 0 {
+        eprintln!("checked {} file(s): {} with syntax errors", files.len(), syntax_errors);
+        return 1;
     }
+    if syntax_only {
+        println!("checked {} file(s): no syntax errors", files.len());
+        return 0;
+    }
+
+    // Phase 2: names and types.
+    let refs: Vec<&iocaste::ast::SourceFile> = asts.iter().collect();
+    let errs = iocaste::sema::analyze(&refs);
+    if errs.is_empty() {
+        for f in &files {
+            println!("ok      {}", f.display());
+        }
+        println!("\nchecked {} file(s): no errors", files.len());
+        return 0;
+    }
+    for e in &errs {
+        if e.file < files.len() {
+            eprint!("{}", e.diag.render(&files[e.file].display().to_string(), &sources[e.file]));
+        } else {
+            eprint!("{}", e.diag.render("<prelude>", iocaste::sema::PRELUDE));
+            eprintln!("(this is a bug in the built-in prelude, not in your code)");
+        }
+        eprintln!();
+    }
+    eprintln!("checked {} file(s): {} error(s)", files.len(), errs.len());
+    1
 }
 
 fn cmd_ast(args: &[String]) -> i32 {

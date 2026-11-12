@@ -322,6 +322,7 @@ impl Parser {
     fn parse_enum(&mut self, attributes: Vec<Attribute>, modifiers: Modifiers) -> PResult<EnumDecl> {
         let span = self.expect_kw("enum")?;
         let (name, _) = self.ident("an enum name")?;
+        let generics = self.parse_generic_params()?;
         self.expect(&Tok::LBrace)?;
         let mut variants = Vec::new();
         while !self.at(&Tok::RBrace) {
@@ -334,7 +335,7 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace)?;
-        Ok(EnumDecl { attributes, modifiers, name, variants, span })
+        Ok(EnumDecl { attributes, modifiers, name, generics, variants, span })
     }
 
     // ------------------------------------------------------------ members

@@ -145,7 +145,7 @@ fn enum_n(e: &EnumDecl) -> Node {
         let vk = v.value.iter().map(|x| n("value", vec![expr_n(x)])).collect();
         kids.push(n(format!("Variant {}{}", v.name, fields), vk));
     }
-    n(format!("Enum {}{}", e.name, fmt_mods(&e.modifiers)), kids)
+    n(format!("Enum {}{}{}", e.name, fmt_generics(&e.generics), fmt_mods(&e.modifiers)), kids)
 }
 
 fn body_kids(b: &Body) -> Vec<Node> {
