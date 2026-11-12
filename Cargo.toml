@@ -1,0 +1,21 @@
+[package]
+name = "iocaste"
+version = "0.0.2-alpha"
+edition = "2021"
+description = "The Iocaste programming language: compiler front-end (lexer, parser, AST)"
+license = "MIT"
+
+[lib]
+name = "iocaste"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ioc"
+path = "src/main.rs"
+
+# No external dependencies on purpose: builds offline and compiles fast.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
