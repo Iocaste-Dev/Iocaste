@@ -1,4 +1,4 @@
-# Iocaste (`.ioc`): v0.0.2-alpha
+# Iocaste (`.ioc`): v0.0.3-alpha
 
 A high-level, OOP-first language that compiles to native code with Rust-style ownership instead of a
 garbage collector. C#-family syntax with TypeScript-style types (`name: Type`).
@@ -87,8 +87,8 @@ iocaste/
 
 | Version | Goal |
 |---|---|
-| **v0.0.2 (now)** | Lexer, parser, AST, `ioc check/ast/tokens/new` |
-| v0.0.3 | Name resolution + type checker |
+| v0.0.2 | Lexer, parser, AST, `ioc check/ast/tokens/new` |
+| **v0.0.3 (now)** | Name resolution + type checker (`ioc check` finds undefined names, type errors, non-exhaustive `match`) |
 | v0.0.4 | Borrow checker (ownership, `ref`, `mut ref`) |
 | v0.0.5 | C backend: Hello World runs, `ioc build` / `ioc run` |
 | v0.0.6 | Standard library core |

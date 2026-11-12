@@ -144,6 +144,7 @@ pub struct EnumDecl {
     pub attributes: Vec<Attribute>,
     pub modifiers: Modifiers,
     pub name: String,
+    pub generics: Vec<GenericParam>,
     pub variants: Vec<EnumVariant>,
     pub span: Span,
 }

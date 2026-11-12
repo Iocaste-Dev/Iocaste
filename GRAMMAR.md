@@ -20,7 +20,7 @@ TypeDecl     = ('class'|'struct'|'interface') IDENT Generics? (':' Type (',' Typ
              | 'record' IDENT Generics? ('(' Params ')')? (':' Type (',' Type)*)? Where* ('{' Member* '}' | ';')
 Generics     = '<' IDENT (',' IDENT)* '>'
 Where        = 'where' IDENT ':' Type (',' Type)*
-EnumDecl     = 'enum' IDENT '{' (Variant (',' Variant)* ','?)? '}'
+EnumDecl     = 'enum' IDENT GenericParams? '{' (Variant (',' Variant)* ','?)? '}'
 Variant      = IDENT ('(' Params ')')? ('=' Expr)?
 ```
 

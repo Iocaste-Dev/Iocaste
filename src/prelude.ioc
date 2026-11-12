@@ -1,0 +1,150 @@
+// Iocaste prelude (v0.0.3): declarations of the built-in types the compiler knows about.
+//
+// This file is itself Iocaste source, parsed by the same front-end as user code.
+// Methods without a body are provided by the runtime / backends (v0.0.5 and later).
+// Everything in `Ioc.Core` is visible in every file without an import.
+
+namespace Ioc.Core {
+
+    public interface IEnumerable<T> { }
+
+    public interface IDisposable {
+        dispose(): void;
+    }
+
+    public interface IComparable<T> {
+        compareTo(other: T): int;
+    }
+
+    // `T?` is shorthand for Option<T>.
+    public enum Option<T> {
+        Some(value: T),
+        None,
+    }
+
+    public enum Result<T, E> {
+        Ok(value: T),
+        Err(error: E),
+    }
+
+    // The result of `spawn { ... }` and of async methods.
+    public class Task<T> {
+        public join(): T;
+    }
+
+    public class Channel<T> : IEnumerable<T> {
+        public constructor() { }
+        public send(value: T): void;
+        public recv(): T?;
+        public close(): void;
+    }
+
+    // Shared ownership (reference counted). Members of T are reachable through it.
+    public class shared<T> {
+        public clone(): shared<T>;
+        public strongCount(): int;
+        public downgrade(): weak<T>;
+    }
+
+    public class weak<T> {
+        public upgrade(): shared<T>?;
+    }
+
+    // ---- primitive types: their members live in these declarations ----
+
+    public struct string {
+        public length: int { get; }
+        public isEmpty(): bool;
+        public contains(value: string): bool;
+        public startsWith(prefix: string): bool;
+        public endsWith(suffix: string): bool;
+        public indexOf(value: string): int?;
+        public substring(start: int, length: int): string;
+        public toUpper(): string;
+        public toLower(): string;
+        public trim(): string;
+        public split(separator: string): string[];
+        public static join(separator: string, parts: string[]): string;
+    }
+
+    public struct bool { public toString(): string; }
+    public struct char { public toString(): string; public isDigit(): bool; public isLetter(): bool; }
+
+    public struct byte { public toString(): string; }
+    public struct sbyte { public toString(): string; }
+    public struct short { public toString(): string; }
+    public struct ushort { public toString(): string; }
+    public struct uint { public toString(): string; }
+    public struct ulong { public toString(): string; }
+    public struct usize { public toString(): string; }
+    public struct isize { public toString(): string; }
+
+    public struct int {
+        public static maxValue: int { get; }
+        public static minValue: int { get; }
+        public static tryParse(text: string): int?;
+        public toString(): string;
+    }
+
+    public struct long {
+        public static tryParse(text: string): long?;
+        public toString(): string;
+    }
+
+    public struct float {
+        public static tryParse(text: string): float?;
+        public toString(): string;
+    }
+
+    public struct double {
+        public static tryParse(text: string): double?;
+        public toString(): string;
+    }
+}
+
+namespace Ioc {
+
+    public static class Console {
+        public static println(text: string): void;
+        public static print(text: string): void;
+        public static error(text: string): void;
+        public static readLine(): string?;
+    }
+
+    public static class Math {
+        public static abs(value: int): int;
+        public static abs(value: double): double;
+        public static min(a: int, b: int): int;
+        public static min(a: double, b: double): double;
+        public static max(a: int, b: int): int;
+        public static max(a: double, b: double): double;
+        public static sqrt(value: double): double;
+        public static pow(value: double, exponent: double): double;
+        public static floor(value: double): double;
+        public static ceil(value: double): double;
+        public static round(value: double): double;
+    }
+}
+
+namespace Ioc.Collections {
+
+    public class List<T> : IEnumerable<T> {
+        public constructor() { }
+        public count: int { get; }
+        public add(item: T): void;
+        public get(index: int): T;
+        public set(index: int, item: T): void;
+        public removeAt(index: int): void;
+        public clear(): void;
+        public contains(item: T): bool;
+    }
+
+    public class Dictionary<K, V> {
+        public constructor() { }
+        public count: int { get; }
+        public add(key: K, value: V): void;
+        public get(key: K): V?;
+        public containsKey(key: K): bool;
+        public remove(key: K): bool;
+    }
+}
