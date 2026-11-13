@@ -1,8 +1,8 @@
 [package]
 name = "iocaste"
-version = "0.0.3-alpha"
+version = "0.0.4-alpha"
 edition = "2021"
-description = "The Iocaste programming language: compiler front-end (lexer, parser, AST, type checker)"
+description = "The Iocaste programming language: compiler front-end (lexer, parser, AST, type and ownership checker)"
 license = "MIT"
 
 [lib]

@@ -1,0 +1,103 @@
+// Iocaste v0.0.1-alpha: syntax preview (not yet compilable)
+// File: src/Program.ioc
+
+namespace MyApp;
+
+import Ioc.Console;
+import Ioc.Collections;
+
+// ---------- Interface ----------
+interface IGreeter {
+    greet(): string;
+}
+
+// ---------- Class with property, constructor, ownership ----------
+public class Greeter : IGreeter {
+    private name: string;
+
+    public constructor(name: string) {
+        this.name = name;
+    }
+
+    // Property with getter
+    public Length: int { get => name.length; }
+
+    public greet(): string => $"Hello, {name}! Welcome to Iocaste.";
+}
+
+// ---------- Enum with data + Result-based error handling ----------
+public enum ParseError {
+    Empty,
+    NotANumber(text: string),
+}
+
+public class Parser {
+    public static parseAge(text: string): Result<int, ParseError> {
+        if (text.isEmpty()) {
+            return Err(ParseError.Empty);
+        }
+        let value = int.tryParse(text) ?? return Err(ParseError.NotANumber(text));
+        return Ok(value);
+    }
+}
+
+// ---------- Ownership demo ----------
+public class Player {
+    public name: string;
+    public score: int = 0;
+
+    public constructor(name: string) { this.name = name; }
+}
+
+public class Game {
+    // Immutable borrow: reads, doesn't take ownership
+    public static show(p: ref Player): void {
+        Console.println($"{p.name}: {p.score}");
+    }
+
+    // Mutable borrow: can change the player
+    public static addScore(p: mut ref Player, points: int): void {
+        p.score += points;
+    }
+
+    // Takes ownership: caller can't use the player afterwards
+    public static retire(p: Player): void {
+        Console.println($"{p.name} retired.");
+    }   // p is freed here automatically
+}
+
+// ---------- Entry point ----------
+public class Program {
+    public static main(args: string[]): int {
+        let greeter = new Greeter("World");
+        Console.println(greeter.greet());
+
+        var player = new Player("Ana");
+        Game.addScore(mut ref player, 10);
+        Game.show(ref player);
+
+        // Shared ownership (opt-in, ref-counted)
+        let shared = new shared<Player>("Ben");
+        let other = shared.clone();          // cheap: bumps the count
+
+        // Lightweight tasks + channels (Go-style)
+        let ch = new Channel<int>();
+        spawn {
+            for (var i = 0; i < 3; i++) { ch.send(i); }
+            ch.close();
+        }
+        for (let n in ch) {
+            Console.println($"got {n}");
+        }
+
+        match (Parser.parseAge("42")) {
+            Ok(age)  => Console.println($"Age: {age}"),
+            Err(e)   => Console.println("Invalid age"),
+        }
+
+        Game.retire(player);                 // player moved here
+        // Game.show(ref player);            // compile error: value moved
+
+        return 0;
+    }
+}

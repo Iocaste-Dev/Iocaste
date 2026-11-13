@@ -48,7 +48,7 @@ COMMANDS:
     version               Show the version
     help                  Show this help
 
-Coming next: borrow checking (v0.0.4), `ioc build` / `ioc run` (v0.0.5)."
+Coming next: C backend, `ioc build` / `ioc run` (v0.0.5)."
     );
 }
 
