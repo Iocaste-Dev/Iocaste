@@ -72,6 +72,7 @@ enum LocalKind {
 }
 
 struct Local {
+    id: usize,
     name: String,
     ty: Ty,
     kind: LocalKind,
@@ -158,6 +159,29 @@ struct Checker<'p, 'a> {
     infer: Vec<Option<Ty>>,
     loops: usize,
     all_locals: Vec<(String, Ty, Span)>,
+    // ---- ownership tracking (v0.0.4)
+    next_id: usize,
+    moved: HashMap<usize, Span>,
+    loans: Vec<Loan>,
+    uses: HashMap<String, Vec<(u32, u32)>>,
+    uses_ready: bool,
+    skip_moved: bool,
+}
+
+/// `let r = ref x;` / `let r = mut ref x;`: `holder` keeps `target` borrowed while `holder` is still used.
+#[derive(Clone)]
+struct Loan {
+    holder_id: usize,
+    holder: String,
+    target: usize,
+    mutable: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Move,
+    Shared,
+    Mut,
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -208,6 +232,131 @@ fn expr_diverges(e: &Expr) -> bool {
     }
 }
 
+
+/// Does this statement always leave the surrounding block (return / break / continue)?
+fn stmt_exits(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue => true,
+        StmtKind::Block(b) | StmtKind::Unsafe(b) => b.stmts.iter().any(stmt_exits),
+        StmtKind::If { then, otherwise, .. } => match otherwise {
+            Some(o) => stmt_exits(then) && stmt_exits(o),
+            None => false,
+        },
+        StmtKind::Expr(e) => expr_diverges(e),
+        _ => false,
+    }
+}
+
+/// The variable at the root of a place expression: `a.b[0].c` -> `a`.
+fn root_ident(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some(n),
+        ExprKind::Member { target, .. } | ExprKind::Index { target, .. } => root_ident(target),
+        _ => None,
+    }
+}
+
+fn collect_block(b: &Block, out: &mut Vec<(String, u32, u32)>) {
+    for s in &b.stmts {
+        collect_stmt(s, out);
+    }
+}
+
+fn collect_stmt(s: &Stmt, out: &mut Vec<(String, u32, u32)>) {
+    match &s.kind {
+        StmtKind::Local { init, .. } => {
+            if let Some(e) = init {
+                collect_expr(e, out);
+            }
+        }
+        StmtKind::Expr(e) => collect_expr(e, out),
+        StmtKind::Block(b) | StmtKind::Unsafe(b) => collect_block(b, out),
+        StmtKind::If { cond, then, otherwise } => {
+            collect_expr(cond, out);
+            collect_stmt(then, out);
+            if let Some(o) = otherwise {
+                collect_stmt(o, out);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            collect_expr(cond, out);
+            collect_stmt(body, out);
+        }
+        StmtKind::For { init, cond, update, body } => {
+            if let Some(i) = init {
+                collect_stmt(i, out);
+            }
+            if let Some(c) = cond {
+                collect_expr(c, out);
+            }
+            if let Some(u) = update {
+                collect_expr(u, out);
+            }
+            collect_stmt(body, out);
+        }
+        StmtKind::ForIn { iter, body, .. } => {
+            collect_expr(iter, out);
+            collect_stmt(body, out);
+        }
+        StmtKind::Return(v) => {
+            if let Some(e) = v {
+                collect_expr(e, out);
+            }
+        }
+        StmtKind::Break | StmtKind::Continue => {}
+    }
+}
+
+fn collect_expr(e: &Expr, out: &mut Vec<(String, u32, u32)>) {
+    match &e.kind {
+        ExprKind::Ident(n) => out.push((n.clone(), e.span.line, e.span.col)),
+        ExprKind::Interp(segs) => {
+            for s in segs {
+                if let InterpSegment::Expr(x) = s {
+                    collect_expr(x, out);
+                }
+            }
+        }
+        ExprKind::Member { target, .. } => collect_expr(target, out),
+        ExprKind::Index { target, index } => {
+            collect_expr(target, out);
+            collect_expr(index, out);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_expr(callee, out);
+            args.iter().for_each(|a| collect_expr(a, out));
+        }
+        ExprKind::New { args, .. } => args.iter().for_each(|a| collect_expr(a, out)),
+        ExprKind::Unary { expr, .. } | ExprKind::Postfix { expr, .. } | ExprKind::Borrow { expr, .. } => collect_expr(expr, out),
+        ExprKind::Try(x) | ExprKind::Await(x) => collect_expr(x, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_expr(lhs, out);
+            collect_expr(rhs, out);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            collect_expr(target, out);
+            collect_expr(value, out);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_expr(scrutinee, out);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    collect_expr(g, out);
+                }
+                collect_expr(&a.body, out);
+            }
+        }
+        ExprKind::Spawn(b) | ExprKind::Block(b) => collect_block(b, out),
+        ExprKind::Return(v) => {
+            if let Some(x) = v {
+                collect_expr(x, out);
+            }
+        }
+        ExprKind::Array(items) => items.iter().for_each(|a| collect_expr(a, out)),
+        _ => {}
+    }
+}
+
 fn block_diverges(b: &Block) -> bool {
     b.stmts.iter().any(stmt_diverges)
 }
@@ -228,6 +377,12 @@ impl<'p, 'a> Checker<'p, 'a> {
             infer: Vec::new(),
             loops: 0,
             all_locals: Vec::new(),
+            next_id: 0,
+            moved: HashMap::new(),
+            loans: Vec::new(),
+            uses: HashMap::new(),
+            uses_ready: false,
+            skip_moved: false,
         }
     }
 
@@ -241,7 +396,12 @@ impl<'p, 'a> Checker<'p, 'a> {
             }
         }
         let file = self.file;
-        self.diags.into_iter().map(|diag| SemaError { file, diag }).collect()
+        let mut seen: HashSet<(u32, u32, String)> = HashSet::new();
+        self.diags
+            .into_iter()
+            .filter(|d| seen.insert((d.span.line, d.span.col, d.message.clone())))
+            .map(|diag| SemaError { file, diag })
+            .collect()
     }
 
     // ------------------------------------------------------------- helpers
@@ -274,7 +434,10 @@ impl<'p, 'a> Checker<'p, 'a> {
     }
 
     fn pop_scope(&mut self) {
-        self.scopes.pop();
+        if let Some(sc) = self.scopes.pop() {
+            let ids: Vec<usize> = sc.iter().map(|l| l.id).collect();
+            self.loans.retain(|l| !ids.contains(&l.holder_id));
+        }
     }
 
     fn declare(&mut self, name: &str, ty: Ty, kind: LocalKind, deferred: bool, span: Span) {
@@ -294,7 +457,183 @@ impl<'p, 'a> Checker<'p, 'a> {
         if self.scopes.is_empty() {
             self.scopes.push(Vec::new());
         }
-        self.scopes.last_mut().unwrap().push(Local { name: name.to_string(), ty, kind, deferred });
+        let id = self.next_id;
+        self.next_id += 1;
+        self.scopes.last_mut().unwrap().push(Local { id, name: name.to_string(), ty, kind, deferred });
+    }
+
+
+    // ------------------------------------------------ ownership (v0.0.4)
+
+    fn find_local(&self, name: &str) -> Option<(usize, Ty)> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(l) = scope.iter().rev().find(|l| l.name == name) {
+                return Some((l.id, l.ty.clone()));
+            }
+        }
+        None
+    }
+
+    fn local_name(&self, id: usize) -> String {
+        for scope in &self.scopes {
+            if let Some(l) = scope.iter().find(|l| l.id == id) {
+                return l.name.clone();
+            }
+        }
+        "value".into()
+    }
+
+    /// Values that are copied instead of moved.
+    fn is_copy(&self, t: &Ty) -> bool {
+        let prog = self.prog;
+        match self.resolve(t) {
+            Ty::Prim(_) | Ty::Ref { .. } | Ty::Void | Ty::Never | Ty::Error | Ty::Infer(_) => true,
+            Ty::Param(_) | Ty::Array(_) => false,
+            Ty::Named { id, args } => {
+                let def = &prog.types[id];
+                match def.kind {
+                    DefKind::Struct => true,
+                    DefKind::Enum => {
+                        if id == prog.lang.option || id == prog.lang.result {
+                            args.iter().all(|a| self.is_copy(a))
+                        } else {
+                            def.variants.iter().all(|v| v.fields.iter().all(|f| self.is_copy(&f.ty)))
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Is `name` mentioned in the source after `at`? (a cheap form of "the borrow is still alive")
+    fn used_after(&self, name: &str, at: Span) -> bool {
+        self.uses.get(name).map_or(false, |v| v.iter().any(|&(l, c)| (l, c) > (at.line, at.col)))
+    }
+
+    /// A borrow of `target` that is still alive at `at` and conflicts with an access.
+    /// `exclusive`: the access writes, moves or mutably borrows (conflicts with every loan);
+    /// otherwise it only reads (conflicts with mutable loans).
+    fn live_loan(&self, target: usize, at: Span, exclusive: bool) -> Option<Loan> {
+        self.loans
+            .iter()
+            .find(|l| l.target == target && (exclusive || l.mutable) && self.used_after(&l.holder, at))
+            .cloned()
+    }
+
+    fn note_use(&mut self, name: &str, id: usize, span: Span) {
+        if !self.skip_moved {
+            if let Some(at) = self.moved.get(&id).copied() {
+                self.err_hint(
+                    span,
+                    format!("use of moved value `{}`", name),
+                    format!(
+                        "`{}` was moved at line {}:{}. Pass `ref {}` to lend it, or `{}.clone()` on a `shared<T>` to copy the handle",
+                        name, at.line, at.col, name, name
+                    ),
+                );
+                return;
+            }
+            if let Some(l) = self.live_loan(id, span, false) {
+                let msg = format!("cannot use `{}` while it is mutably borrowed by `{}`", name, l.holder);
+                self.err_hint(span, msg, format!("`{}` is used again later; finish with `{}` first, or end the borrow in a smaller `{{ }}` block", l.holder, name));
+            }
+        }
+    }
+
+    /// The expression's value is given away (assigned, passed by value, returned...).
+    fn consume(&mut self, e: &Expr) {
+        let ExprKind::Ident(name) = &e.kind else { return };
+        let Some((id, ty)) = self.find_local(name) else { return };
+        if self.is_copy(&ty) {
+            return;
+        }
+        if let Some(l) = self.live_loan(id, e.span, true) {
+            let msg = format!("cannot move `{}` because it is borrowed by `{}`", name, l.holder);
+            self.err_hint(e.span, msg, format!("`{}` is used again later; finish using it first", l.holder));
+        }
+        self.moved.insert(id, e.span);
+    }
+
+    fn consume_args(&mut self, recv: Option<&Expr>, args: &[Expr]) {
+        let mut uses: Vec<(usize, Access, Span, String)> = Vec::new();
+        if let Some(Expr { kind: ExprKind::Ident(n), span }) = recv {
+            if let Some((id, _)) = self.find_local(n) {
+                uses.push((id, Access::Shared, *span, n.clone()));
+            }
+        }
+        for a in args {
+            match &a.kind {
+                ExprKind::Ident(n) => {
+                    if let Some((id, ty)) = self.find_local(n) {
+                        if !self.is_copy(&ty) {
+                            uses.push((id, Access::Move, a.span, n.clone()));
+                        }
+                    }
+                }
+                ExprKind::Borrow { mutable, expr } => {
+                    if let ExprKind::Ident(n) = &expr.kind {
+                        if let Some((id, _)) = self.find_local(n) {
+                            uses.push((id, if *mutable { Access::Mut } else { Access::Shared }, a.span, n.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        'outer: for i in 0..uses.len() {
+            for j in 0..i {
+                if uses[i].0 == uses[j].0 && (uses[i].1 != Access::Shared || uses[j].1 != Access::Shared) {
+                    let msg = format!("`{}` is used more than once in this call, and one use moves it or borrows it mutably", uses[i].3);
+                    self.err_hint(uses[i].2, msg, "pass it once, or make a copy/`shared<T>` handle for the other use");
+                    break 'outer;
+                }
+            }
+        }
+        for a in args {
+            self.consume(a);
+        }
+    }
+
+    fn merge_states(&mut self, before: HashMap<usize, Span>, states: Vec<HashMap<usize, Span>>) {
+        if states.is_empty() {
+            self.moved = before;
+            return;
+        }
+        let mut out: HashMap<usize, Span> = HashMap::new();
+        for st in states {
+            for (k, v) in st {
+                out.entry(k).or_insert(v);
+            }
+        }
+        self.moved = out;
+    }
+
+    /// Run a loop body. Anything declared outside the loop that the body moves would be moved
+    /// again on the next iteration.
+    fn loop_body<F: FnOnce(&mut Self)>(&mut self, body: &Stmt, f: F) {
+        let before = self.moved.clone();
+        let start = self.next_id;
+        f(self);
+        let after = self.moved.clone();
+        if !stmt_exits(body) {
+            let mut fresh: Vec<(usize, Span)> =
+                after.iter().filter(|(k, _)| !before.contains_key(k) && **k < start).map(|(k, v)| (*k, *v)).collect();
+            fresh.sort_by_key(|(_, sp)| (sp.line, sp.col));
+            for (id, sp) in fresh {
+                let n = self.local_name(id);
+                self.err_hint(
+                    sp,
+                    format!("`{}` is moved inside a loop, so it would be moved again on the next iteration", n),
+                    format!("lend it with `ref {}`, or give `{}` a new value before the loop repeats", n, n),
+                );
+            }
+        }
+        let mut merged = before;
+        for (k, v) in after {
+            merged.entry(k).or_insert(v);
+        }
+        self.moved = merged;
     }
 
     // ----------------------------------------------------------- inference
@@ -611,6 +950,14 @@ impl<'p, 'a> Checker<'p, 'a> {
     // ---------------------------------------------------------- statements
 
     fn block(&mut self, b: &Block) {
+        if !self.uses_ready {
+            self.uses_ready = true;
+            let mut u = Vec::new();
+            collect_block(b, &mut u);
+            for (n, l, c) in u {
+                self.uses.entry(n).or_default().push((l, c));
+            }
+        }
         self.push_scope();
         for s in &b.stmts {
             self.stmt(s);
@@ -641,16 +988,31 @@ impl<'p, 'a> Checker<'p, 'a> {
             StmtKind::Block(b) | StmtKind::Unsafe(b) => self.block(b),
             StmtKind::If { cond, then, otherwise } => {
                 self.cond(cond);
+                let before = self.moved.clone();
                 self.sub_stmt(then);
-                if let Some(o) = otherwise {
-                    self.sub_stmt(o);
+                let mut states: Vec<HashMap<usize, Span>> = Vec::new();
+                if !stmt_exits(then) {
+                    states.push(self.moved.clone());
                 }
+                self.moved = before.clone();
+                match otherwise {
+                    Some(o) => {
+                        self.sub_stmt(o);
+                        if !stmt_exits(o) {
+                            states.push(self.moved.clone());
+                        }
+                    }
+                    None => states.push(before.clone()),
+                }
+                self.merge_states(before, states);
             }
             StmtKind::While { cond, body } => {
                 self.cond(cond);
-                self.loops += 1;
-                self.sub_stmt(body);
-                self.loops -= 1;
+                self.loop_body(body, |c| {
+                    c.loops += 1;
+                    c.sub_stmt(body);
+                    c.loops -= 1;
+                });
             }
             StmtKind::For { init, cond, update, body } => {
                 self.push_scope();
@@ -663,9 +1025,11 @@ impl<'p, 'a> Checker<'p, 'a> {
                 if let Some(u) = update {
                     self.expr(u, None);
                 }
-                self.loops += 1;
-                self.sub_stmt(body);
-                self.loops -= 1;
+                self.loop_body(body, |c| {
+                    c.loops += 1;
+                    c.sub_stmt(body);
+                    c.loops -= 1;
+                });
                 self.pop_scope();
             }
             StmtKind::ForIn { mutable, name, iter, body } => {
@@ -691,9 +1055,11 @@ impl<'p, 'a> Checker<'p, 'a> {
                 };
                 self.push_scope();
                 self.declare(name, elem, if *mutable { LocalKind::Var } else { LocalKind::Let }, false, s.span);
-                self.loops += 1;
-                self.sub_stmt(body);
-                self.loops -= 1;
+                self.loop_body(body, |c| {
+                    c.loops += 1;
+                    c.sub_stmt(body);
+                    c.loops -= 1;
+                });
                 self.pop_scope();
             }
             StmtKind::Return(v) => self.check_return(v.as_ref(), s.span),
@@ -721,7 +1087,17 @@ impl<'p, 'a> Checker<'p, 'a> {
             (Some(t), None) => t.clone(),
             (None, None) => Ty::Error,
         };
+        if let Some(e) = init {
+            self.consume(e);
+        }
         self.declare(name, final_ty, if mutable { LocalKind::Var } else { LocalKind::Let }, init.is_none(), span);
+        if let Some(Expr { kind: ExprKind::Borrow { mutable: m, expr }, .. }) = init {
+            if let ExprKind::Ident(t) = &expr.kind {
+                if let (Some((tid, _)), Some((hid, _))) = (self.find_local(t), self.find_local(name)) {
+                    self.loans.push(Loan { holder_id: hid, holder: name.to_string(), target: tid, mutable: *m });
+                }
+            }
+        }
     }
 
     fn check_return(&mut self, v: Option<&Expr>, span: Span) {
@@ -734,6 +1110,20 @@ impl<'p, 'a> Checker<'p, 'a> {
                 } else {
                     let t = self.expr(x, Some(&ret));
                     self.coerce_at(x.span, &t, &ret);
+                    self.consume(x);
+                    if let (Ty::Ref { .. }, ExprKind::Borrow { expr, .. }) = (self.resolve(&ret), &x.kind) {
+                        if let ExprKind::Ident(n) = &expr.kind {
+                            if let Some((_, ty)) = self.find_local(n) {
+                                if !matches!(self.resolve(&ty), Ty::Ref { .. }) {
+                                    self.err_hint(
+                                        x.span,
+                                        format!("cannot return a reference to the local variable `{}`", n),
+                                        "it is freed when the method ends; return the value itself (move it out) instead",
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             None => {
@@ -806,8 +1196,20 @@ impl<'p, 'a> Checker<'p, 'a> {
                 self.err_hint(e.span, "`base` cannot be used on its own", "use it to reach a member of the base class: `base.name`");
                 Ty::Error
             }
-            ExprKind::Call { callee, args } => self.call(callee, args, e.span, exp),
-            ExprKind::New { ty, args } => self.new_expr(ty, args, e.span),
+            ExprKind::Call { callee, args } => {
+                let t = self.call(callee, args, e.span, exp);
+                let recv = match &callee.kind {
+                    ExprKind::Member { target, .. } => Some(&**target),
+                    _ => None,
+                };
+                self.consume_args(recv, args);
+                t
+            }
+            ExprKind::New { ty, args } => {
+                let t = self.new_expr(ty, args, e.span);
+                self.consume_args(None, args);
+                t
+            }
             ExprKind::Unary { op, expr } => self.unary(*op, expr, exp),
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, e.span),
             ExprKind::Assign { op, target, value } => self.assign(*op, target, value, e.span),
@@ -849,6 +1251,7 @@ impl<'p, 'a> Checker<'p, 'a> {
                 for it in items {
                     let t = self.expr(it, Some(&elem));
                     self.coerce_at(it.span, &t, &elem);
+                    self.consume(it);
                 }
                 Ty::Array(Box::new(elem))
             }
@@ -983,13 +1386,16 @@ impl<'p, 'a> Checker<'p, 'a> {
         // 1. local variables and parameters
         for scope in self.scopes.iter().rev() {
             if let Some(l) = scope.iter().rev().find(|l| l.name == name) {
-                return Res::Val(Val {
+                let lid = l.id;
+                let res = Res::Val(Val {
                     ty: l.ty.clone(),
                     ro: false,
                     root: Some(Root { name: name.into(), declared_mut: l.kind == LocalKind::Var }),
                     kind: ValKind::Local { kind: l.kind, deferred: l.deferred },
                     name: name.into(),
                 });
+                self.note_use(name, lid, span);
+                return res;
             }
         }
         let prog = self.prog;
@@ -1776,7 +2182,19 @@ impl<'p, 'a> Checker<'p, 'a> {
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr, span: Span) -> Ty {
-        let Some(v) = self.target_val(target) else {
+        let plain = if let (AssignOp::Assign, ExprKind::Ident(n)) = (op, &target.kind) { self.find_local(n) } else { None };
+        self.skip_moved = plain.is_some();
+        let tv = self.target_val(target);
+        self.skip_moved = false;
+        if let Some(root) = root_ident(target) {
+            if let Some((id, _)) = self.find_local(root) {
+                if let Some(l) = self.live_loan(id, target.span, true).filter(|l| !l.mutable) {
+                    let msg = format!("cannot assign to `{}` because it is borrowed by `{}`", root, l.holder);
+                    self.err_hint(target.span, msg, format!("`{}` is still used later; finish using it first, or end the borrow in a smaller `{{ }}` block", l.holder));
+                }
+            }
+        }
+        let Some(v) = tv else {
             self.expr(value, None);
             return Ty::Void;
         };
@@ -1787,6 +2205,10 @@ impl<'p, 'a> Checker<'p, 'a> {
             AssignOp::Assign => {
                 let vt = self.expr(value, Some(&tty));
                 self.coerce_at(value.span, &vt, &tty);
+                self.consume(value);
+                if let Some((id, _)) = plain {
+                    self.moved.remove(&id);
+                }
             }
             _ => {
                 let lr = self.peel(&tty);
@@ -1838,6 +2260,18 @@ impl<'p, 'a> Checker<'p, 'a> {
         };
         if mutable {
             self.require_mutable(&v, x.span, MutKind::Borrow);
+        }
+        if let ExprKind::Ident(n) = &x.kind {
+            if let Some((id, _)) = self.find_local(n) {
+                if mutable {
+                    if let Some(l) = self.live_loan(id, x.span, true) {
+                        if !l.mutable {
+                            let msg = format!("cannot borrow `{}` as mutable because it is already borrowed by `{}`", n, l.holder);
+                            self.err_hint(x.span, msg, "only one `mut ref` OR any number of `ref` can exist at the same time");
+                        }
+                    }
+                }
+            }
         }
         let inner = self.resolve(&v.ty);
         if let Ty::Ref { mutable: m0, inner: i0 } = &inner {
@@ -2072,7 +2506,10 @@ impl<'p, 'a> Checker<'p, 'a> {
         let sty = self.peel(&st);
         let mut result: Option<Ty> = None;
         let mut covers: Vec<(PatCover, bool)> = Vec::new();
+        let before = self.moved.clone();
+        let mut states: Vec<HashMap<usize, Span>> = Vec::new();
         for arm in arms {
+            self.moved = before.clone();
             self.push_scope();
             let cover = self.pattern(&arm.pattern, &sty);
             if let Some(g) = &arm.guard {
@@ -2082,9 +2519,10 @@ impl<'p, 'a> Checker<'p, 'a> {
             let bt = self.expr(&arm.body, hint.as_ref());
             self.pop_scope();
             covers.push((cover, arm.guard.is_some()));
-            if matches!(self.shallow(&bt), Ty::Never) {
+            if matches!(self.shallow(&bt), Ty::Never) || expr_diverges(&arm.body) {
                 continue;
             }
+            states.push(self.moved.clone());
             match &result {
                 None => result = Some(bt),
                 Some(r) => {
@@ -2103,6 +2541,7 @@ impl<'p, 'a> Checker<'p, 'a> {
                 }
             }
         }
+        self.merge_states(before, states);
         // exhaustiveness
         let rs = self.resolve(&sty);
         if !rs.has_error() {

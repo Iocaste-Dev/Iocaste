@@ -1,0 +1,73 @@
+// Iocaste v0.0.3-alpha: a program the type checker accepts.
+namespace Shapes;
+
+import Ioc.Console;
+import Ioc.Collections;
+
+public interface IShape {
+    area(): double;
+    name(): string;
+}
+
+public abstract class Shape : IShape {
+    public abstract area(): double;
+    public virtual name(): string => "shape";
+}
+
+public class Circle : Shape {
+    private radius: double;
+    public constructor(radius: double) { this.radius = radius; }
+    public override area(): double => 3.14159 * radius * radius;
+    public override name(): string => "circle";
+}
+
+public class Rect : Shape {
+    private w: double;
+    private h: double;
+    public constructor(w: double, h: double) { this.w = w; this.h = h; }
+    public override area(): double => w * h;
+}
+
+public enum Cmd {
+    Quit,
+    Move(dx: int, dy: int),
+}
+
+public class Program {
+    static describe(c: Cmd): string {
+        return match (c) {
+            Quit => "quit",
+            Move(dx, dy) => $"move {dx},{dy}",
+        };
+    }
+
+    static divide(a: int, b: int): Result<int, string> {
+        if (b == 0) { return Err("divide by zero"); }
+        return Ok(a / b);
+    }
+
+    static half(a: int): Result<int, string> {
+        let q = divide(a, 2)?;
+        return Ok(q);
+    }
+
+    public static main(args: string[]): int {
+        let shapes = new List<IShape>();
+        shapes.add(new Circle(2.0));
+        shapes.add(new Rect(3.0, 4.0));
+
+        var total = 0.0;
+        for (let s in shapes) {
+            total += s.area();
+            Console.println($"{s.name()}: {s.area()}");
+        }
+        Console.println($"total {total}");
+        Console.println(describe(Cmd.Move(1, 2)));
+
+        match (half(10)) {
+            Ok(v) => Console.println($"half = {v}"),
+            Err(e) => Console.println(e),
+        }
+        return 0;
+    }
+}

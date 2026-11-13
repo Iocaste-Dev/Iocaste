@@ -1,0 +1,117 @@
+// Iocaste v0.0.2-alpha: parser feature tour.
+// Exercises every construct the parser understands. Syntax only: not compilable yet.
+
+import Ioc.Collections;
+
+namespace Demo.Features {
+
+    @Serializable
+    public record Point(x: int, y: int);
+
+    public struct Vec2 {
+        public x: float;
+        public y: float;
+        public constructor(x: float, y: float) { this.x = x; this.y = y; }
+        public lengthSquared(): float => (x * x + y * y);
+    }
+
+    public interface IRepository<T> : IDisposable {
+        find(id: int): T?;
+        all(): List<T>;
+    }
+
+    public abstract class Shape {
+        public abstract area(): double;
+        public virtual describe(): string => $"Shape with area {area()}";
+    }
+
+    public class Circle : Shape {
+        private radius: double;
+        public constructor(radius: double = 1.0) { this.radius = radius; }
+        public override area(): double => 3.14159 * radius * radius;
+        public override describe(): string => base.describe() + " (circle)";
+    }
+
+    public class Box<T> where T : IComparable<T>, IDisposable {
+        private items: List<T> = new List<T>();
+
+        public Count: int { get => items.count; private set; }
+        public Label: string { get; set; } = "box";
+        public IsEmpty: bool => items.count == 0;
+
+        public add(item: T): void { items.push(item); }
+
+        public first(): T? {
+            if (items.count == 0) { return None; }
+            return Some(items[0]);
+        }
+
+        public static identity<U>(value: U): U { return value; }
+
+        public destructor() { }
+    }
+
+    public enum Status {
+        Active = 1,
+        Inactive = 2,
+        Banned(reason: string),
+    }
+
+    public class Outer {
+        public class Inner { public value: int = 0; }
+        private enum Mode { Fast, Slow }
+    }
+
+    @Test
+    public class Service {
+        @Route("/users")
+        public static async fetch(url: string): Task<string> {
+            let body = await Http.get(url)?;
+            return body;
+        }
+
+        public static run(items: ref List<int>, limit: int = 10): Result<int, string> {
+            var total: int = 0;
+            let mask = 0xFF;
+            let bits = 0b1010;
+            let big = 1_000_000L;
+            let ratio = 3.14f;
+            let sci = 2.5e3;
+            let letter = 'a';
+            let newline = '\n';
+            let nums = [1, 2, 3];
+            let first = nums[0];
+            let fallback = lookup(first) ?? 0;
+            let flag = !(total > 1 && limit < 5) || total == 0;
+            let neg = -total;
+
+            while (total < limit) {
+                total += 1;
+                if (total == 5) { continue; }
+                else if (total > 8) { break; }
+                else { total++; }
+            }
+
+            for (var i = 0; i < 10; i++) { total = total + i * 2 - 1; }
+            for (;;) { break; }
+            for (let item in items) { total += item; }
+
+            unsafe { raw.write(0, 1); }
+
+            spawn { Worker.run(mut ref total); }
+
+            match (total) {
+                0 => Console.println("zero"),
+                -1 => Console.println("minus one"),
+                1 => { Console.println("one"); },
+                n if n > 100 => Console.println($"big: {n}"),
+                Status.Active => Console.println("active"),
+                Status.Banned(reason) => Console.println(reason),
+                _ => Console.println("other"),
+            }
+
+            Console.println($"mask={mask} bits={bits} nested={"x" + "y"} {{braces}}");
+            return Ok(total);
+        }
+    }
+}
