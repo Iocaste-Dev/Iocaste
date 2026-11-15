@@ -1,0 +1,38 @@
+// Iocaste v0.0.4-alpha: every mistake below is caught by `ioc check`.
+namespace Demo;
+
+import Ioc.Console;
+
+public class Player {
+    public name: string;
+    public score: int = 0;
+    public constructor(name: string) { this.name = name; }
+}
+
+public class Game {
+    static show(p: ref Player): void { Console.println(p.name); }
+    static retire(p: Player): void { Console.println("bye"); }
+
+    public static main(args: string[]): int {
+        // 1. use after move
+        let a = new Player("Ana");
+        Game.retire(a);
+        Game.show(ref a);
+
+        // 2. moved inside a loop
+        let b = new Player("Ben");
+        var i = 0;
+        while (i < 3) {
+            Game.retire(b);
+            i++;
+        }
+
+        // 3. changing a value while it is borrowed
+        var c = new Player("Cy");
+        let view = ref c;
+        c.score = 10;
+        Game.show(view);
+
+        return 0;
+    }
+}

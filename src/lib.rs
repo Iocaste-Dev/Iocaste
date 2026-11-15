@@ -6,6 +6,7 @@
 //! Later versions add the borrow checker and backends.
 
 pub mod ast;
+pub mod cgen;
 pub mod check;
 pub mod diag;
 pub mod dump;
