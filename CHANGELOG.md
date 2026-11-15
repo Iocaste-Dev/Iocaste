@@ -1,5 +1,6 @@
 # Changelog
 
+
 ## v0.0.5-alpha (Step 5): programs run
 
 - **`ioc build`** compiles Iocaste to C and then to a native executable in `./build` (needs `cc`/gcc/clang; set `IOC_CC` to choose).
@@ -17,6 +18,8 @@
 
 Known limits: strings created at run time are freed when the program exits, not earlier (automatic freeing arrives with objects in v0.0.6);
 `Console.readLine` needs `Option` support; the C file is the only backend so far.
+
+=======
 
 ## v0.0.4-alpha (Step 4): ownership
 

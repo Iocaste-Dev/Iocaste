@@ -53,6 +53,7 @@ COMMANDS:
     help                  Show this help
 
 Coming next: objects, enums, Result/Option and generics in the backend (v0.0.6)."
+=======
     );
 }
 
