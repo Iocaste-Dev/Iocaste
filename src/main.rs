@@ -22,6 +22,8 @@ fn run(args: &[String]) -> i32 {
             0
         }
         Some("check") => cmd_check(&args[1..]),
+        Some("build") => cmd_build(&args[1..]),
+        Some("run") => cmd_run(&args[1..]),
         Some("ast") => cmd_ast(&args[1..]),
         Some("tokens") => cmd_tokens(&args[1..]),
         Some("new") => cmd_new(&args[1..]),
@@ -43,12 +45,15 @@ USAGE:
 COMMANDS:
     new <name>            Create a new project (ioc.toml + src/Program.ioc)
     check [file.ioc...]   Check syntax, names and types (--syntax-only). Without a file, checks every .ioc under ./src
+    build [file.ioc...]   Compile to a native program in ./build   (--emit-c: only write the C file, --debug)
+    run [file.ioc...]     Build and run; arguments after `--` go to the program
     ast <file.ioc>        Print the syntax tree      (--ascii: plain characters, --raw: Rust debug dump)
     tokens <file.ioc>     Print the token stream
     version               Show the version
     help                  Show this help
 
-Coming next: C backend, `ioc build` / `ioc run` (v0.0.5)."
+Coming next: objects, enums, Result/Option and generics in the backend (v0.0.6)."
+=======
     );
 }
 
@@ -76,35 +81,37 @@ fn collect_ioc_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 // -------------------------------------------------------------- commands
 
-fn cmd_check(args: &[String]) -> i32 {
-    let syntax_only = args.iter().any(|a| a == "--syntax-only");
+struct Front {
+    files: Vec<PathBuf>,
+    sources: Vec<String>,
+    asts: Vec<iocaste::ast::SourceFile>,
+}
+
+/// Find the files, then run syntax and semantic checks. Prints errors; `Err` is the exit code.
+fn front_end(args: &[String], syntax_only: bool) -> Result<Front, i32> {
     let paths: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let files: Vec<PathBuf> = if paths.is_empty() {
         let src = Path::new("src");
         if !src.is_dir() {
-            eprintln!("ioc: no `src` folder here. Run inside a project, or pass a file: ioc check <file.ioc>");
-            return 2;
+            eprintln!("ioc: no `src` folder here. Run inside a project, or pass a file: ioc <command> <file.ioc>");
+            return Err(2);
         }
         let mut v = Vec::new();
         collect_ioc_files(src, &mut v);
         if v.is_empty() {
             eprintln!("ioc: no .ioc files found under ./src");
-            return 2;
+            return Err(2);
         }
         v
     } else {
         paths.iter().map(|p| PathBuf::from(p.as_str())).collect()
     };
 
-    // Phase 1: syntax.
     let mut sources = Vec::new();
     let mut asts = Vec::new();
     let mut syntax_errors = 0;
     for f in &files {
-        let src = match read_source(f) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
+        let src = read_source(f)?;
         match parser::parse(&src) {
             Ok(ast) => asts.push(ast),
             Err(d) => {
@@ -117,34 +124,152 @@ fn cmd_check(args: &[String]) -> i32 {
     }
     if syntax_errors > 0 {
         eprintln!("checked {} file(s): {} with syntax errors", files.len(), syntax_errors);
-        return 1;
+        return Err(1);
     }
-    if syntax_only {
-        println!("checked {} file(s): no syntax errors", files.len());
-        return 0;
+    if !syntax_only {
+        let refs: Vec<&iocaste::ast::SourceFile> = asts.iter().collect();
+        let errs = iocaste::sema::analyze(&refs);
+        if !errs.is_empty() {
+            for e in &errs {
+                if e.file < files.len() {
+                    eprint!("{}", e.diag.render(&files[e.file].display().to_string(), &sources[e.file]));
+                } else {
+                    eprint!("{}", e.diag.render("<prelude>", iocaste::sema::PRELUDE));
+                    eprintln!("(this is a bug in the built-in prelude, not in your code)");
+                }
+                eprintln!();
+            }
+            eprintln!("checked {} file(s): {} error(s)", files.len(), errs.len());
+            return Err(1);
+        }
     }
+    Ok(Front { files, sources, asts })
+}
 
-    // Phase 2: names and types.
-    let refs: Vec<&iocaste::ast::SourceFile> = asts.iter().collect();
-    let errs = iocaste::sema::analyze(&refs);
-    if errs.is_empty() {
-        for f in &files {
-            println!("ok      {}", f.display());
+fn cmd_check(args: &[String]) -> i32 {
+    let syntax_only = args.iter().any(|a| a == "--syntax-only");
+    match front_end(args, syntax_only) {
+        Err(c) => c,
+        Ok(f) => {
+            if !syntax_only {
+                for p in &f.files {
+                    println!("ok      {}", p.display());
+                }
+                println!();
+            }
+            println!(
+                "checked {} file(s): no {}",
+                f.files.len(),
+                if syntax_only { "syntax errors" } else { "errors" }
+            );
+            0
         }
-        println!("\nchecked {} file(s): no errors", files.len());
-        return 0;
     }
-    for e in &errs {
-        if e.file < files.len() {
-            eprint!("{}", e.diag.render(&files[e.file].display().to_string(), &sources[e.file]));
-        } else {
-            eprint!("{}", e.diag.render("<prelude>", iocaste::sema::PRELUDE));
-            eprintln!("(this is a bug in the built-in prelude, not in your code)");
+}
+
+/// Name of the program: `name = "..."` in ./ioc.toml, else the first file's name.
+fn program_name(files: &[PathBuf], explicit_files: bool) -> String {
+    if !explicit_files {
+        if let Ok(t) = fs::read_to_string("ioc.toml") {
+            for line in t.lines() {
+                let l = line.trim();
+                if let Some(rest) = l.strip_prefix("name") {
+                    if let Some(v) = rest.trim_start().strip_prefix('=') {
+                        let n = v.trim().trim_matches('"').trim();
+                        if !n.is_empty() {
+                            return n.to_string();
+                        }
+                    }
+                }
+            }
         }
-        eprintln!();
     }
-    eprintln!("checked {} file(s): {} error(s)", files.len(), errs.len());
-    1
+    files[0].file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "program".into())
+}
+
+/// Generate C, compile it, and return the path of the executable.
+fn build(args: &[String]) -> Result<PathBuf, i32> {
+    let explicit = args.iter().any(|a| !a.starts_with("--"));
+    let front = front_end(args, false)?;
+    let refs: Vec<&iocaste::ast::SourceFile> = front.asts.iter().collect();
+    let c = match iocaste::cgen::generate(&refs) {
+        Ok(c) => c,
+        Err(errs) => {
+            for e in &errs {
+                eprint!("{}", e.diag.render(&front.files[e.file].display().to_string(), &front.sources[e.file]));
+                eprintln!();
+            }
+            eprintln!("build failed: {} error(s)", errs.len());
+            return Err(1);
+        }
+    };
+    let name = program_name(&front.files, explicit);
+    let dir = Path::new("build");
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("ioc: cannot create `build`: {}", e);
+        return Err(2);
+    }
+    let c_path = dir.join(format!("{}.c", name));
+    if let Err(e) = fs::write(&c_path, &c) {
+        eprintln!("ioc: cannot write `{}`: {}", c_path.display(), e);
+        return Err(2);
+    }
+    if args.iter().any(|a| a == "--emit-c") {
+        println!("wrote   {}", c_path.display());
+        return Ok(c_path);
+    }
+    let exe = dir.join(if cfg!(windows) { format!("{}.exe", name) } else { name.clone() });
+    let cc = std::env::var("IOC_CC").unwrap_or_else(|_| "cc".into());
+    let opt: &[&str] = if args.iter().any(|a| a == "--debug") { &["-O0", "-g"] } else { &["-O2"] };
+    let out = std::process::Command::new(&cc)
+        .args(opt)
+        .args(["-fwrapv", "-w", "-o"])
+        .arg(&exe)
+        .arg(&c_path)
+        .arg("-lm")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            println!("built   {}", exe.display());
+            Ok(exe)
+        }
+        Ok(o) => {
+            eprintln!("ioc: the C compiler failed. This is a bug in the Iocaste backend; the generated C is in {}", c_path.display());
+            eprint!("{}", String::from_utf8_lossy(&o.stderr));
+            Err(1)
+        }
+        Err(e) => {
+            eprintln!("ioc: cannot run the C compiler `{}`: {}", cc, e);
+            eprintln!("     Install gcc or clang, or set IOC_CC to your compiler.");
+            Err(2)
+        }
+    }
+}
+
+fn cmd_build(args: &[String]) -> i32 {
+    match build(args) {
+        Ok(_) => 0,
+        Err(c) => c,
+    }
+}
+
+fn cmd_run(args: &[String]) -> i32 {
+    // arguments after `--` go to the program
+    let split = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let (ours, theirs) = args.split_at(split);
+    let theirs: Vec<&String> = theirs.iter().skip(1).collect();
+    let exe = match build(ours) {
+        Ok(e) => e,
+        Err(c) => return c,
+    };
+    let status = std::process::Command::new(&exe).args(theirs).status();
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("ioc: cannot run `{}`: {}", exe.display(), e);
+            2
+        }
+    }
 }
 
 fn cmd_ast(args: &[String]) -> i32 {

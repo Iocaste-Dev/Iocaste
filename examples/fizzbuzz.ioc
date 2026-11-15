@@ -1,0 +1,27 @@
+// Iocaste v0.0.5-alpha: a program the C backend can build and run.
+//   ioc run examples/fizzbuzz.ioc
+namespace FizzBuzz;
+
+import Ioc.Console;
+
+public class Program {
+    static label(n: int): string {
+        if (n % 15 == 0) { return "FizzBuzz"; }
+        if (n % 3 == 0) { return "Fizz"; }
+        if (n % 5 == 0) { return "Buzz"; }
+        return n.toString();
+    }
+
+    static fib(n: int): long {
+        if (n < 2) { return n; }
+        return fib(n - 1) + fib(n - 2);
+    }
+
+    public static main(args: string[]): int {
+        for (var i = 1; i <= 15; i++) {
+            Console.println(label(i));
+        }
+        Console.println($"fib(35) = {fib(35)}");
+        return 0;
+    }
+}

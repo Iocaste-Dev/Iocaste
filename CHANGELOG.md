@@ -1,5 +1,26 @@
 # Changelog
 
+
+## v0.0.5-alpha (Step 5): programs run
+
+- **`ioc build`** compiles Iocaste to C and then to a native executable in `./build` (needs `cc`/gcc/clang; set `IOC_CC` to choose).
+  `--emit-c` writes only the C file, `--debug` builds without optimisation.
+- **`ioc run [files] [-- args]`** builds and runs; the program's exit code is `main`'s return value.
+- Backend subset: classes made of `static` methods (with overloads), `int`/`long`/`short`/`byte`/unsigned/`float`/`double`/
+  `bool`/`char`/`string`, `string[]` (command-line `args`), `let`/`var`, `if`/`while`/`for`, `break`/`continue`,
+  arithmetic, string interpolation and `+`, `Console.println/print/error`, `Math.*`, and `toString`, `length`, `isEmpty`,
+  `contains`, `startsWith`, `endsWith`, `toUpper`, `toLower`, `trim`, `substring` on strings.
+- Safe by default: division by zero and bad indexes stop the program with `panic:` (exit code 101); integer overflow wraps.
+- Anything else (objects, enums, `match`, `Result`/`Option`, generics, `ref`, `spawn`...) is still checked by `ioc check`
+  but stops `ioc build` with "not supported by the C backend yet", pointing at the exact line.
+- `examples/fizzbuzz.ioc`; 11 end-to-end tests (source -> C -> native -> output).
+- Speed: `fib(35)` plus compiling takes about 0.14 s.
+
+Known limits: strings created at run time are freed when the program exits, not earlier (automatic freeing arrives with objects in v0.0.6);
+`Console.readLine` needs `Option` support; the C file is the only backend so far.
+
+=======
+
 ## v0.0.4-alpha (Step 4): ownership
 
 - **Moves**: passing, assigning, returning or storing a non-copy value gives it away; using it afterwards is
