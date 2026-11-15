@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.0.6-alpha (Step 6): toolchain commands
+
+New commands (see `docs/CLI.md`, or `ioc help <command>`):
+- **`ioc install`**: checks that a C compiler exists and installs the clusters listed in `ioc.toml` `[clusters]`, writing `ioc.lock`.
+  If the compiler is missing it prints the exact command for your system (apt, dnf, pacman, apk, zypper, Xcode, winget);
+  `ioc install --toolchain --yes` runs that command for you. Nothing is installed silently.
+- **`ioc add` / `ioc remove` / `ioc list`**: manage clusters. `ioc add mathx --path ../mathx` works today; registry clusters
+  (`ioc add ioc.api ^0.1`) give a clear "registry not online yet" message (planned v0.6.0).
+- **Clusters are real**: their `src/*.ioc` files are compiled together with your project, so `import MathX;` just works.
+  Transitive clusters, name/version checks and cycle detection included. `ioc.lock` stores a content hash; if a cluster
+  changes, `ioc build` tells you to run `ioc install`.
+- **`ioc doctor`**: what is installed and what is missing (C compiler, ioc home, update channel, manifest, clusters).
+- **`ioc version --verbose`**, **`ioc update`** (reads the latest version from `update_url`, an https URL or a local file;
+  exit code 10 means "update available"), **`ioc clean`**, **`ioc init`**, **`ioc env`**, **`ioc config get/set/unset`**
+  (settings: `cc`, `update_url`), **`ioc help <command>`**.
+- Versions understand `0.0.5-alpha`, `^0.1`, `~1.2`, `>=1.0`. `ioc.toml` is read by a small strict TOML reader with line-numbered errors.
+- 16 new tests (version rules, manifest editing, lock file, and the whole CLI end to end).
+
+Roadmap change: objects in the backend move to v0.0.7.
 
 ## v0.0.5-alpha (Step 5): programs run
 
@@ -18,8 +37,6 @@
 
 Known limits: strings created at run time are freed when the program exits, not earlier (automatic freeing arrives with objects in v0.0.6);
 `Console.readLine` needs `Option` support; the C file is the only backend so far.
-
-=======
 
 ## v0.0.4-alpha (Step 4): ownership
 
