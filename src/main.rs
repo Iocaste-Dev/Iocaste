@@ -1,6 +1,8 @@
-//! `ioc`: the Iocaste command-line tool (v0.0.2-alpha).
+//! `ioc`: the Iocaste command-line tool.
 //!
-//! Commands: check, ast, tokens, new, version, help.
+//! Commands: check, build, run, install, add, remove, list, doctor, update, clean, config, env, init, new, ast, tokens, version, help.
+
+mod commands;
 
 use iocaste::{dump, lexer, parser, VERSION};
 use std::path::{Path, PathBuf};
@@ -13,14 +15,31 @@ fn main() {
 
 fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        None | Some("help") | Some("--help") | Some("-h") => {
+        None | Some("--help") | Some("-h") => {
             print_help();
             0
         }
-        Some("version") | Some("--version") | Some("-V") => {
-            println!("ioc {}  (Iocaste language v{})", VERSION, VERSION);
-            0
-        }
+        Some("help") => match args.get(1).and_then(|c| commands::command_help(c)) {
+            Some(t) => {
+                println!("{}", t);
+                0
+            }
+            None => {
+                print_help();
+                0
+            }
+        },
+        Some("version") | Some("--version") | Some("-V") => commands::cmd_version(&args[1..]),
+        Some("install") => commands::cmd_install(&args[1..]),
+        Some("add") => commands::cmd_add(&args[1..]),
+        Some("remove") => commands::cmd_remove(&args[1..]),
+        Some("list") => commands::cmd_list(&args[1..]),
+        Some("doctor") => commands::cmd_doctor(&args[1..]),
+        Some("update") => commands::cmd_update(&args[1..]),
+        Some("clean") => commands::cmd_clean(&args[1..]),
+        Some("config") => commands::cmd_config(&args[1..]),
+        Some("env") => commands::cmd_env(&args[1..]),
+        Some("init") => commands::cmd_init(&args[1..]),
         Some("check") => cmd_check(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
@@ -43,17 +62,33 @@ USAGE:
     ioc <command> [arguments]
 
 COMMANDS:
-    new <name>            Create a new project (ioc.toml + src/Program.ioc)
-    check [file.ioc...]   Check syntax, names and types (--syntax-only). Without a file, checks every .ioc under ./src
-    build [file.ioc...]   Compile to a native program in ./build   (--emit-c: only write the C file, --debug)
+  Write code
+    new <name>            Create a new project folder
+    init                  Turn the current folder into a project
+    check [file.ioc...]   Check syntax, names, types, ownership (--syntax-only)
+    build [file.ioc...]   Compile to a native program in ./build (--emit-c, --debug)
     run [file.ioc...]     Build and run; arguments after `--` go to the program
-    ast <file.ioc>        Print the syntax tree      (--ascii: plain characters, --raw: Rust debug dump)
-    tokens <file.ioc>     Print the token stream
-    version               Show the version
-    help                  Show this help
+    clean                 Delete ./build
 
-Coming next: objects, enums, Result/Option and generics in the backend (v0.0.6)."
-=======
+  Packages (clusters)
+    install               Check the toolchain and install the clusters in ioc.toml
+    add <name> [version]  Add a cluster  (or: add --path <folder>)
+    remove <name>         Remove a cluster
+    list                  Show this project's clusters
+
+  The tool itself
+    doctor                Show what is installed and what is missing
+    version [--verbose]   Show the version
+    update                Check whether a newer ioc exists
+    config / env          Settings and paths
+
+  Inspect
+    ast <file.ioc>        Print the syntax tree      (--ascii, --raw)
+    tokens <file.ioc>     Print the token stream
+
+`ioc help <command>` explains one command.
+
+Coming next: objects, enums, Result/Option and generics in the backend (v0.0.7)."
     );
 }
 
@@ -101,6 +136,13 @@ fn front_end(args: &[String], syntax_only: bool) -> Result<Front, i32> {
         if v.is_empty() {
             eprintln!("ioc: no .ioc files found under ./src");
             return Err(2);
+        }
+        match commands::cluster_sources(Path::new(".")) {
+            Ok(extra) => v.extend(extra),
+            Err(e) => {
+                eprintln!("ioc: {}", e);
+                return Err(1);
+            }
         }
         v
     } else {
@@ -219,7 +261,7 @@ fn build(args: &[String]) -> Result<PathBuf, i32> {
         return Ok(c_path);
     }
     let exe = dir.join(if cfg!(windows) { format!("{}.exe", name) } else { name.clone() });
-    let cc = std::env::var("IOC_CC").unwrap_or_else(|_| "cc".into());
+    let cc = commands::detect_cc().map(|c| c.cmd).unwrap_or_else(|| "cc".into());
     let opt: &[&str] = if args.iter().any(|a| a == "--debug") { &["-O0", "-g"] } else { &["-O2"] };
     let out = std::process::Command::new(&cc)
         .args(opt)
@@ -352,6 +394,11 @@ fn cmd_new(args: &[String]) -> i32 {
         eprintln!("ioc: `{}` already exists", name);
         return 2;
     }
+    scaffold(root, name, name)
+}
+
+/// Write the files of a new project into `root`. `shown` is the folder name used in messages ("" = here).
+fn scaffold(root: &Path, name: &str, shown: &str) -> i32 {
     let ns = pascal_case(name);
 
     let manifest = format!(
@@ -411,8 +458,13 @@ public class Program {{
     match result {
         Ok(()) => {
             println!("Created project `{}`", name);
-            println!("  {0}/ioc.toml\n  {0}/src/Program.ioc\n  {0}/tests/", name);
-            println!("\nNext:\n  cd {}\n  ioc check", name);
+            let p = if shown.is_empty() { String::new() } else { format!("{}/", shown) };
+            println!("  {0}ioc.toml\n  {0}src/Program.ioc\n  {0}tests/", p);
+            if shown.is_empty() {
+                println!("\nNext:\n  ioc run");
+            } else {
+                println!("\nNext:\n  cd {}\n  ioc run", shown);
+            }
             0
         }
         Err(e) => {

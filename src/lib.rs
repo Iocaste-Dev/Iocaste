@@ -11,10 +11,12 @@ pub mod check;
 pub mod diag;
 pub mod dump;
 pub mod lexer;
+pub mod manifest;
 pub mod parser;
 pub mod sema;
 pub mod symbols;
 pub mod ty;
+pub mod version;
 
 /// Version of this toolchain (also the language version for now).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
