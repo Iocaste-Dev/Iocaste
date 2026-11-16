@@ -1,0 +1,70 @@
+// Iocaste v0.0.7-alpha: classes, ownership and automatic cleanup.
+//   ioc run examples/objects.ioc
+namespace Objects;
+
+import Ioc.Console;
+
+public class Player {
+    public name: string;
+    public score: int = 0;
+    public Level: int { get; set; }
+
+    public constructor(name: string) {
+        this.name = name;
+        Level = 1;
+    }
+
+    destructor() {
+        Console.println($"  (freeing {name})");
+    }
+
+    public addScore(points: int): void {
+        score += points;
+        if (score >= 100) { Level = Level + 1; }
+    }
+
+    public describe(): string => $"{name}: {score} points, level {Level}";
+}
+
+public class Team {
+    public title: string;
+    public captain: Player;
+
+    public constructor(title: string, captain: Player) {
+        this.title = title;
+        this.captain = captain;       // the team now owns the captain
+    }
+
+    public rename(newCaptain: Player): void {
+        captain = newCaptain;         // the old captain is freed here
+    }
+}
+
+public class Program {
+    static show(p: ref Player): void {
+        Console.println(p.describe());
+    }
+
+    static bump(p: mut ref Player, by: int): void {
+        p.addScore(by);
+    }
+
+    static retire(p: Player): void {
+        Console.println($"{p.name} retires");
+    }   // p is freed when the method ends
+
+    public static main(args: string[]): int {
+        var ana = new Player("Ana");
+        bump(mut ref ana, 60);
+        bump(mut ref ana, 70);
+        show(ref ana);
+
+        let team = new Team("Reds", new Player("Ben"));
+        team.rename(new Player("Cy"));
+        Console.println($"{team.title} captain: {team.captain.name}");
+
+        retire(ana);                  // ana is moved: using it again is a compile error
+        Console.println("end of main");
+        return 0;
+    }
+}

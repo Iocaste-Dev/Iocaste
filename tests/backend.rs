@@ -19,6 +19,15 @@ static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 
 /// Returns (exit code, stdout, stderr).
 fn run(src: &str) -> (i32, String, String) {
+    run_with(src, false)
+}
+
+/// Same, but built with AddressSanitizer: any double free / use after free fails the run.
+fn run_asan(src: &str) -> (i32, String, String) {
+    run_with(src, true)
+}
+
+fn run_with(src: &str, asan: bool) -> (i32, String, String) {
     let c = compile(src).expect("must compile");
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("iocaste-test-{}-{}", std::process::id(), n));
@@ -26,9 +35,10 @@ fn run(src: &str) -> (i32, String, String) {
     let cp = dir.join("p.c");
     let ep = dir.join("p");
     std::fs::write(&cp, c).unwrap();
-    let o = Command::new("cc").args(["-O1", "-fwrapv", "-Wall", "-Werror", "-Wno-unused-function", "-Wno-unused-variable", "-Wno-unused-but-set-variable", "-Wno-return-type", "-o"]).arg(&ep).arg(&cp).arg("-lm").output().unwrap();
+    let sanitize: &[&str] = if asan { &["-fsanitize=address,undefined", "-g"] } else { &[] };
+    let o = Command::new("cc").args(sanitize).args(["-O1", "-fwrapv", "-Wall", "-Werror", "-Wno-unused-function", "-Wno-unused-variable", "-Wno-unused-but-set-variable", "-Wno-return-type", "-Wno-unused-label", "-o"]).arg(&ep).arg(&cp).arg("-lm").output().unwrap();
     assert!(o.status.success(), "C compile failed:\n{}", String::from_utf8_lossy(&o.stderr));
-    let r = Command::new(&ep).output().unwrap();
+    let r = Command::new(&ep).env("ASAN_OPTIONS", "detect_leaks=0").output().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     (
         r.status.code().unwrap_or(-1),
@@ -123,7 +133,7 @@ fn args_are_available() {
 
 #[test]
 fn unsupported_features_get_a_clear_error() {
-    let e = compile("namespace T;\npublic class P { name: string; public static main(): int { return 0; } }").unwrap_err();
+    let e = compile("namespace T;\npublic enum E { A, B }\npublic class P { public static main(): int { return 0; } }").unwrap_err();
     assert!(e.contains("not supported by the C backend"), "{}", e);
 }
 
@@ -131,4 +141,138 @@ fn unsupported_features_get_a_clear_error() {
 fn missing_main_is_reported() {
     let e = compile("namespace T;\npublic class P { static f(): int { return 0; } }").unwrap_err();
     assert!(e.contains("no entry point"), "{}", e);
+}
+
+// ------------------------------------------------------------------ objects (v0.0.7)
+
+const RES: &str = "public class Res {
+    public id: int;
+    public constructor(id: int) { this.id = id; Console.println($\"make {id}\"); }
+    destructor() { Console.println($\"free {id}\"); }
+}
+";
+
+fn objects(body: &str, extra: &str) -> String {
+    format!(
+        "namespace T;\nimport Ioc.Console;\n{}\npublic class P {{\n{}\n public static main(args: string[]): int {{ {} return 0; }}\n}}",
+        RES, extra, body
+    )
+}
+
+#[test]
+fn objects_example_runs_and_frees_everything_once() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/objects.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(
+        out,
+        "Ana: 130 points, level 2\n  (freeing Ben)\nReds captain: Cy\nAna retires\n  (freeing Ana)\nend of main\n  (freeing Cy)\n"
+    );
+}
+
+#[test]
+fn locals_are_freed_in_reverse_order_at_scope_end() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects("let a = new Res(1); let b = new Res(2); { let c = new Res(3); } Console.println(\"end\");", ""));
+    assert_eq!(out, "make 1\nmake 2\nmake 3\nfree 3\nend\nfree 2\nfree 1\n");
+}
+
+#[test]
+fn moved_values_are_freed_exactly_once_by_the_new_owner() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects(
+        "let a = new Res(1); take(a); Console.println(\"after\");",
+        "static take(r: Res): void { Console.println(\"took\"); }",
+    ));
+    assert_eq!(out, "make 1\ntook\nfree 1\nafter\n");
+}
+
+#[test]
+fn early_return_and_break_free_what_is_in_scope() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects(
+        "let a = new Res(1); Console.println($\"{f(true)}\"); var i = 0; while (i < 3) { let r = new Res(10 + i); i++; if (i == 2) { break; } }",
+        "static f(early: bool): int { let x = new Res(5); if (early) { return 7; } return 8; }",
+    ));
+    assert_eq!(
+        out,
+        "make 1\nmake 5\nfree 5\n7\nmake 10\nfree 10\nmake 11\nfree 11\nfree 1\n"
+    );
+}
+
+#[test]
+fn returning_an_object_hands_it_to_the_caller() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects(
+        "let r = make(4); Console.println(\"got\");",
+        "static make(id: int): Res { let x = new Res(id); return x; }",
+    ));
+    assert_eq!(out, "make 4\ngot\nfree 4\n");
+}
+
+#[test]
+fn replacing_a_value_frees_the_old_one() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects("var r = new Res(1); r = new Res(2); Console.println(\"end\");", ""));
+    assert_eq!(out, "make 1\nmake 2\nfree 1\nend\nfree 2\n");
+}
+
+#[test]
+fn a_discarded_result_is_freed() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects("make(1); Console.println(\"end\");", "static make(id: int): Res { return new Res(id); }"));
+    assert_eq!(out, "make 1\nfree 1\nend\n");
+}
+
+#[test]
+fn fields_methods_properties_and_overloads() {
+    if !have_cc() { return; }
+    let src = "namespace T;
+import Ioc.Console;
+public class Acc {
+    public total: int = 10;
+    public Name: string { get; set; }
+    public Double: int { get => total * 2; }
+    public constructor() { Name = \"zero\"; }
+    public constructor(start: int) { total = start; Name = \"s\"; }
+    public add(n: int): ref Acc { total += n; return ref this; }
+    public add(s: string): int => total + s.length;
+}
+public class P { public static main(): int {
+    var a = new Acc(5); let b = new Acc();
+    a.add(3).add(1); a.Name = \"x\" + a.Name;
+    Console.println($\"{a.total} {a.Double} {a.Name} {b.total} {b.Name} {a.add(\"abc\")}\");
+    return 0; } }";
+    let (code, out, _) = run_asan(src);
+    assert_eq!(code, 0);
+    assert_eq!(out, "9 18 xs 10 zero 12\n");
+}
+
+#[test]
+fn borrowed_objects_are_not_freed_by_the_borrower() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&objects(
+        "let a = new Res(1); look(ref a); look(ref a); Console.println(\"end\");",
+        "static look(r: ref Res): void { Console.println($\"look {r.id}\"); }",
+    ));
+    assert_eq!(out, "make 1\nlook 1\nlook 1\nend\nfree 1\n");
+}
+
+#[test]
+fn moving_out_of_a_field_is_refused_not_miscompiled() {
+    let src = objects("let h = new Holder(new Res(1)); let r = h.item;", "").replace(
+        "public class P {",
+        "public class Holder { public item: Res; public constructor(i: Res) { item = i; } }\npublic class P {",
+    );
+    let e = compile(&src).unwrap_err();
+    assert!(e.contains("moving an object out of a field"), "{}", e);
+}
+
+#[test]
+fn returning_this_by_value_is_a_check_error() {
+    let src = "namespace T;\npublic class A { public f(): A { return this; } }\npublic class P { public static main(): int { return 0; } }";
+    let ast = parser::parse(src).unwrap();
+    let errs = sema::analyze(&[&ast]);
+    assert!(errs.iter().any(|e| e.diag.message.contains("cannot move `this`")), "{:?}", errs.iter().map(|e| &e.diag.message).collect::<Vec<_>>());
 }

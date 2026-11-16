@@ -140,3 +140,10 @@ static int64_t ioc_check_index(int64_t i, int64_t len) {
     return i;
 }
 #define IOC_INDEX(i, len) ioc_check_index((int64_t)(i), (int64_t)(len))
+/* ---- objects (v0.0.7): every class value is an owned pointer; moving out leaves NULL, drop(NULL) does nothing */
+static void *ioc_zalloc(size_t n) {
+    void *p = calloc(1, n ? n : 1);
+    if (!p) ioc_panic("out of memory");
+    return p;
+}
+#define IOC_TAKE(p) ({ __typeof__(p) ioc_t_ = (p); (p) = NULL; ioc_t_; })
