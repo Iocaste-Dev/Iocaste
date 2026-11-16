@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.0.7-alpha (Step 7): objects
+
+`ioc build` / `ioc run` now compile programs with classes.
+- **Classes**: fields (with initializers), auto-properties (`{ get; set; }`), getter properties (`{ get => ... }`),
+  constructors (several, chosen by argument types), `destructor() { }`, static and instance methods with overloads,
+  `new`, `this`, unqualified use of fields and methods inside a class.
+- **Automatic memory management**: every object has one owner and is freed when that owner goes out of scope, in reverse
+  order of declaration, including on `return`, `break` and `continue`. Passing an object by value moves it (the receiver
+  frees it); replacing a field or variable frees the old object; a discarded result is freed. `ref` / `mut ref` to objects
+  are plain borrows and never free anything. Destructors run exactly when the object is freed.
+- Verified with AddressSanitizer (no double free, no use after free) in the test-suite; every object in the example is freed.
+- New check rule: `this` cannot be moved out (`return this;` is an error; use `ref this` and a `ref Class` return type).
+- The backend refuses, with a clear message, what it cannot do safely yet: moving an object out of a field, `ref` to numbers,
+  inheritance/interfaces, `virtual`/`override`, static fields, enums, `match`, `Result`/`Option`, generics.
+- `examples/objects.ioc`; 12 new end-to-end tests.
+
+Known limits: strings built at run time (interpolation, `+`) are still only freed at program exit, so a long loop that builds
+many strings grows memory; owned strings arrive with the standard library.
+
+Roadmap: v0.0.8 enums, `match`, `Result`/`Option`; v0.0.9 inheritance, interfaces; v0.1.0 generics, tasks and channels.
+
 ## v0.0.6-alpha (Step 6): toolchain commands
 
 New commands (see `docs/CLI.md`, or `ioc help <command>`):

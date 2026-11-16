@@ -88,7 +88,7 @@ COMMANDS:
 
 `ioc help <command>` explains one command.
 
-Coming next: objects, enums, Result/Option and generics in the backend (v0.0.7)."
+Coming next: enums, `match`, Result/Option in the backend (v0.0.8)."
     );
 }
 

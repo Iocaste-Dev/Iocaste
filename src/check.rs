@@ -543,6 +543,17 @@ impl<'p, 'a> Checker<'p, 'a> {
 
     /// The expression's value is given away (assigned, passed by value, returned...).
     fn consume(&mut self, e: &Expr) {
+        if let ExprKind::This = &e.kind {
+            if !self.is_static && !self.is_copy(&self.this_ty()) {
+                let cname = self.prog.types[self.tid].name.clone();
+                self.err_hint(
+                    e.span,
+                    "cannot move `this` out of the object",
+                    format!("`this` is borrowed, not owned. To hand it out, borrow it: `ref this` (type `ref {}`)", cname),
+                );
+            }
+            return;
+        }
         let ExprKind::Ident(name) = &e.kind else { return };
         let Some((id, ty)) = self.find_local(name) else { return };
         if self.is_copy(&ty) {
