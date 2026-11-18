@@ -137,3 +137,12 @@ fn generic_inference() {
     ok(&in_main("let l = new List<string>(); l.add(\"a\"); let s: string = l.get(0);"));
     fails(&in_main("let l = new List<string>(); l.add(1);"), "");
 }
+
+#[test]
+fn nested_patterns_are_checked_for_exhaustiveness() {
+    ok("class P { static f(r: Result<int?, string>): int { return match (r) { Ok(Some(v)) => v, Ok(None) => 0, Err(e) => 1 }; } }");
+    fails(
+        "class P { static f(r: Result<int?, string>): int { return match (r) { Ok(Some(v)) => v, Err(e) => 1 }; } }",
+        "missing `Ok`",
+    );
+}

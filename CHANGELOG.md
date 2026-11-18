@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.0.8-alpha (Step 8): enums, match, Result / Option
+
+Error handling without exceptions or `null` now compiles and runs.
+- **Enums with data**: `enum Shape { Circle(radius: double), Rect(w: double, h: double), Dot }`, built with `Shape.Circle(2.0)`.
+- **`Result<T, E>` and `Option<T>` (`T?`)**: `Ok(..)`, `Err(..)`, `Some(..)`, `None`; a plain value returned where `T?` is expected becomes `Some`.
+- **`match`** as a statement or as a value: variant patterns with bindings (`Ok(v)`), nested patterns (`Ok(Some(v))`),
+  number / string / bool / char patterns, `_`, guards (`Ok(age) if age >= 18`), block arms, `return` in arms.
+- **`?`** returns the error early from a method that returns a matching `Result` / `Option`.
+- **`??`** gives a default for an `Option`; `x ?? return Err(..)` returns early when it is empty.
+- **`int.tryParse`, `long.tryParse`, `double.tryParse`...** check the whole text and the range. `Console.readLine()` returns `string?`.
+- **Checker fix**: exhaustiveness now understands nested patterns (`Ok(Some(v))` + `Ok(None)` + `Err(e)` is complete).
+  The checker also passes the resolved types of `Ok(..)` / `None` to the code generator.
+- `examples/results.ioc`; 8 new end-to-end tests (run under AddressSanitizer) and 1 new checker test.
+
+Known limits: values stored inside enums, `Result` or `Option` must be plain (numbers, strings, other such enums);
+objects inside them (`Option<Player>`) come with the standard library. `match` and `?` cannot appear in a loop condition
+or on the right of `&&` / `||` (the backend says so). Generic user enums and enum variants with explicit values are not built yet.
+
+Roadmap: v0.0.9 inheritance and interfaces; v0.1.0 generics, tasks and channels, objects inside enums / collections.
+
 ## v0.0.7-alpha (Step 7): objects
 
 `ioc build` / `ioc run` now compile programs with classes.

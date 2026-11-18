@@ -88,7 +88,7 @@ COMMANDS:
 
 `ioc help <command>` explains one command.
 
-Coming next: enums, `match`, Result/Option in the backend (v0.0.8)."
+Coming next: inheritance and interfaces in the backend (v0.0.9)."
     );
 }
 
@@ -117,6 +117,7 @@ fn collect_ioc_files(dir: &Path, out: &mut Vec<PathBuf>) {
 // -------------------------------------------------------------- commands
 
 struct Front {
+    types: iocaste::sema::TypeTable,
     files: Vec<PathBuf>,
     sources: Vec<String>,
     asts: Vec<iocaste::ast::SourceFile>,
@@ -168,9 +169,11 @@ fn front_end(args: &[String], syntax_only: bool) -> Result<Front, i32> {
         eprintln!("checked {} file(s): {} with syntax errors", files.len(), syntax_errors);
         return Err(1);
     }
+    let mut types = Default::default();
     if !syntax_only {
         let refs: Vec<&iocaste::ast::SourceFile> = asts.iter().collect();
-        let errs = iocaste::sema::analyze(&refs);
+        let (errs, table) = iocaste::sema::analyze_full(&refs);
+        types = table;
         if !errs.is_empty() {
             for e in &errs {
                 if e.file < files.len() {
@@ -185,7 +188,7 @@ fn front_end(args: &[String], syntax_only: bool) -> Result<Front, i32> {
             return Err(1);
         }
     }
-    Ok(Front { files, sources, asts })
+    Ok(Front { types, files, sources, asts })
 }
 
 fn cmd_check(args: &[String]) -> i32 {
@@ -234,7 +237,7 @@ fn build(args: &[String]) -> Result<PathBuf, i32> {
     let explicit = args.iter().any(|a| !a.starts_with("--"));
     let front = front_end(args, false)?;
     let refs: Vec<&iocaste::ast::SourceFile> = front.asts.iter().collect();
-    let c = match iocaste::cgen::generate(&refs) {
+    let c = match iocaste::cgen::generate(&refs, &front.types) {
         Ok(c) => c,
         Err(errs) => {
             for e in &errs {

@@ -5,10 +5,14 @@
 //! scope; moving leaves NULL behind), `ref` / `mut ref` to objects; the primitive types, `string`,
 //! `string[]` (command-line arguments); `let`/`var`; `if`/`while`/`for`; arithmetic; string
 //! interpolation and `+`; `Console` and `Math`; a few `string` methods.
+//! Enums with data (payloads must be plain values: numbers, strings, other such enums), `match`,
+//! `Result<T,E>` / `Option<T>` (`T?`), `?`, `??`, `int.tryParse`.
 //! Everything else reports "not supported by the C backend yet".
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
+use crate::sema::TypeTable;
+use crate::ty::TyInfo;
 use std::collections::HashMap;
 
 pub const RUNTIME: &str = include_str!("runtime.h");
@@ -39,12 +43,15 @@ enum CT {
     Obj(usize),
     /// a borrowed object (`ref` / `mut ref`, or `this`)
     Ref(usize),
+    /// an enum value (user enum, or an instance of Option / Result)
+    Enum(usize),
 }
 
 impl CT {
     fn c(self) -> String {
         match self {
             CT::Obj(i) | CT::Ref(i) => return format!("ioc_c{}*", i),
+            CT::Enum(i) => return format!("ioc_e{}", i),
             _ => {}
         }
         match self {
@@ -63,7 +70,7 @@ impl CT {
             CT::Str => "ioc_string",
             CT::StrArr => "ioc_strarr",
             CT::Void => "void",
-            CT::Obj(_) | CT::Ref(_) => unreachable!(),
+            CT::Obj(_) | CT::Ref(_) | CT::Enum(_) => unreachable!(),
         }
         .to_string()
     }
@@ -78,6 +85,17 @@ impl CT {
     }
     fn is_unsigned(self) -> bool {
         matches!(self, CT::U8 | CT::U16 | CT::U32 | CT::U64)
+    }
+}
+
+impl CT {
+    /// The type of a value after it was converted for storing as `self`.
+    fn max_with(self, from: CT) -> CT {
+        if matches!(self, CT::Enum(_)) || from == self {
+            self
+        } else {
+            from
+        }
     }
 }
 
@@ -138,6 +156,24 @@ struct Class<'a> {
     dtor: Option<&'a DtorDecl>,
 }
 
+#[derive(Clone, PartialEq)]
+enum EKind {
+    User,
+    Option(CT),
+    Result(CT, CT),
+}
+
+struct VariantI {
+    name: String,
+    fields: Vec<(String, CT)>,
+}
+
+struct EnumI {
+    name: String,
+    kind: EKind,
+    variants: Vec<VariantI>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
     Method,
@@ -168,6 +204,10 @@ struct Arg {
 }
 
 struct Gen<'a> {
+    types: &'a TypeTable,
+    enums: Vec<EnumI>,
+    tmp: usize,
+    expect: Option<CT>,
     methods: Vec<Method<'a>>,
     classes: Vec<Class<'a>>,
     errors: Vec<CError>,
@@ -188,32 +228,100 @@ impl<'a> Gen<'a> {
         self.classes.iter().position(|c| c.name == name)
     }
 
-    fn type_ct(&self, t: &TypeRef) -> Option<CT> {
+    /// Can a value of this type sit inside an enum? (plain values only: no objects yet)
+    fn payload_ok(ct: CT) -> bool {
+        !matches!(ct, CT::Obj(_) | CT::Ref(_) | CT::StrArr | CT::Void)
+    }
+
+    fn find_enum(&self, name: &str) -> Option<usize> {
+        self.enums.iter().position(|e| e.kind == EKind::User && e.name == name)
+    }
+
+    fn option_of(&mut self, inner: CT) -> Option<usize> {
+        if !Self::payload_ok(inner) {
+            return None;
+        }
+        if let Some(i) = self.enums.iter().position(|e| e.kind == EKind::Option(inner)) {
+            return Some(i);
+        }
+        self.enums.push(EnumI {
+            name: "Option".into(),
+            kind: EKind::Option(inner),
+            variants: vec![
+                VariantI { name: "Some".into(), fields: vec![("value".into(), inner)] },
+                VariantI { name: "None".into(), fields: vec![] },
+            ],
+        });
+        Some(self.enums.len() - 1)
+    }
+
+    fn result_of(&mut self, ok: CT, err: CT) -> Option<usize> {
+        if !Self::payload_ok(ok) || !Self::payload_ok(err) {
+            return None;
+        }
+        if let Some(i) = self.enums.iter().position(|e| e.kind == EKind::Result(ok, err)) {
+            return Some(i);
+        }
+        self.enums.push(EnumI {
+            name: "Result".into(),
+            kind: EKind::Result(ok, err),
+            variants: vec![
+                VariantI { name: "Ok".into(), fields: vec![("value".into(), ok)] },
+                VariantI { name: "Err".into(), fields: vec![("error".into(), err)] },
+            ],
+        });
+        Some(self.enums.len() - 1)
+    }
+
+    fn prim_ct(name: &str) -> Option<CT> {
+        Some(match name {
+            "bool" => CT::Bool,
+            "char" => CT::Char,
+            "sbyte" => CT::I8,
+            "short" => CT::I16,
+            "int" => CT::I32,
+            "long" | "isize" => CT::I64,
+            "byte" => CT::U8,
+            "ushort" => CT::U16,
+            "uint" => CT::U32,
+            "ulong" | "usize" => CT::U64,
+            "float" => CT::F32,
+            "double" => CT::F64,
+            "string" => CT::Str,
+            "void" => CT::Void,
+            _ => return None,
+        })
+    }
+
+    fn type_ct(&mut self, t: &TypeRef) -> Option<CT> {
         match &t.kind {
-            TypeRefKind::Named { path, args } if args.is_empty() => {
-                if path.len() == 1 {
-                    let p = match path[0].as_str() {
-                        "bool" => Some(CT::Bool),
-                        "char" => Some(CT::Char),
-                        "sbyte" => Some(CT::I8),
-                        "short" => Some(CT::I16),
-                        "int" => Some(CT::I32),
-                        "long" | "isize" => Some(CT::I64),
-                        "byte" => Some(CT::U8),
-                        "ushort" => Some(CT::U16),
-                        "uint" => Some(CT::U32),
-                        "ulong" | "usize" => Some(CT::U64),
-                        "float" => Some(CT::F32),
-                        "double" => Some(CT::F64),
-                        "string" => Some(CT::Str),
-                        "void" => Some(CT::Void),
-                        _ => None,
-                    };
-                    if p.is_some() {
-                        return p;
+            TypeRefKind::Named { path, args } => {
+                let last = path.last()?.as_str();
+                if path.len() == 1 && args.is_empty() {
+                    if let Some(p) = Self::prim_ct(last) {
+                        return Some(p);
                     }
                 }
-                self.find_class(path.last()?).map(CT::Obj)
+                if args.len() == 1 && last == "Option" {
+                    let inner = self.type_ct(&args[0])?;
+                    return self.option_of(inner).map(CT::Enum);
+                }
+                if args.len() == 2 && last == "Result" {
+                    let a = self.type_ct(&args[0])?;
+                    let b = self.type_ct(&args[1])?;
+                    return self.result_of(a, b).map(CT::Enum);
+                }
+                if !args.is_empty() {
+                    return None;
+                }
+                if let Some(e) = self.find_enum(last) {
+                    return Some(CT::Enum(e));
+                }
+                self.find_class(last).map(CT::Obj)
+            }
+            TypeRefKind::Optional(inner) => {
+                let i = self.type_ct(inner)?;
+                self.option_of(i).map(CT::Enum)
             }
             TypeRefKind::Array(inner) => match self.type_ct(inner) {
                 Some(CT::Str) => Some(CT::StrArr),
@@ -223,7 +331,41 @@ impl<'a> Gen<'a> {
                 Some(CT::Obj(i)) => Some(CT::Ref(i)),
                 _ => None,
             },
-            _ => None,
+        }
+    }
+
+    /// The type the checker resolved for the call / name / member at `span`.
+    fn table_ct(&mut self, span: Span, tag: u8) -> Option<CT> {
+        let info = self.types.get(&(self.file, span.line, span.col, tag))?.clone();
+        self.info_ct(&info)
+    }
+
+    fn info_ct(&mut self, info: &TyInfo) -> Option<CT> {
+        match info {
+            TyInfo::Prim(n) => Self::prim_ct(n),
+            TyInfo::Void => Some(CT::Void),
+            TyInfo::Array(i) => match self.info_ct(i)? {
+                CT::Str => Some(CT::StrArr),
+                _ => None,
+            },
+            TyInfo::Ref(i) => match self.info_ct(i)? {
+                CT::Obj(c) => Some(CT::Ref(c)),
+                _ => None,
+            },
+            TyInfo::Named(n, args) => match (n.as_str(), args.len()) {
+                ("Option", 1) => {
+                    let i = self.info_ct(&args[0])?;
+                    self.option_of(i).map(CT::Enum)
+                }
+                ("Result", 2) => {
+                    let a = self.info_ct(&args[0])?;
+                    let b = self.info_ct(&args[1])?;
+                    self.result_of(a, b).map(CT::Enum)
+                }
+                (name, 0) => self.find_enum(name).map(CT::Enum).or_else(|| self.find_class(name).map(CT::Obj)),
+                _ => None,
+            },
+            TyInfo::Unknown => None,
         }
     }
 }
@@ -249,9 +391,14 @@ fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect()
 }
 
+
 /// Generate C for all `files`. Assumes the program already passed the type and ownership checks.
-pub fn generate(files: &[&SourceFile]) -> Result<String, Vec<CError>> {
+pub fn generate(files: &[&SourceFile], types: &TypeTable) -> Result<String, Vec<CError>> {
     let mut g = Gen {
+        types,
+        enums: Vec::new(),
+        tmp: 0,
+        expect: None,
         methods: Vec::new(),
         classes: Vec::new(),
         errors: Vec::new(),
@@ -305,11 +452,23 @@ pub fn generate(files: &[&SourceFile]) -> Result<String, Vec<CError>> {
         }]);
     }
 
+    // bodies first: generating them may create more Option / Result instances
+    for i in 0..g.classes.len() {
+        g.emit_class(i);
+    }
+    for i in 0..g.methods.len() {
+        g.emit_method(i);
+    }
+    if !g.errors.is_empty() {
+        return Err(g.errors);
+    }
+    let defs = std::mem::take(&mut g.out);
     g.out.push_str(RUNTIME);
     g.out.push_str("\n/* ---- program */\n");
     for i in 0..g.classes.len() {
         g.out.push_str(&format!("typedef struct ioc_c{0} ioc_c{0};\n", i));
     }
+    g.emit_enums();
     for i in 0..g.classes.len() {
         g.emit_struct(i);
     }
@@ -328,15 +487,7 @@ pub fn generate(files: &[&SourceFile]) -> Result<String, Vec<CError>> {
         g.out.push_str(&format!("static {};\n", sig));
     }
     g.out.push('\n');
-    for i in 0..g.classes.len() {
-        g.emit_class(i);
-    }
-    for i in 0..g.methods.len() {
-        g.emit_method(i);
-    }
-    if !g.errors.is_empty() {
-        return Err(g.errors);
-    }
+    g.out.push_str(&defs);
     let e = &g.methods[entry];
     let call_args = if e.params.is_empty() { "" } else { "args" };
     let call = format!("{}({})", e.c_name, call_args);
@@ -356,7 +507,7 @@ impl<'a> Gen<'a> {
     fn unsupported(&mut self, span: Span, what: &str) {
         self.errors.push(CError {
             file: self.file,
-            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.7)", what), span)
+            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.8)", what), span)
                 .with_hint("`ioc check` still validates it; code generation for it arrives in the next versions"),
         });
     }
@@ -368,9 +519,39 @@ impl<'a> Gen<'a> {
             match it {
                 Item::Namespace(n) => self.register_items(&n.items),
                 Item::Type(t) => self.register_type(t),
+                Item::Enum(e) => self.register_enum(e),
                 _ => {}
             }
         }
+    }
+
+    fn register_enum(&mut self, e: &'a EnumDecl) {
+        if e.generics.is_empty() {
+            self.enums.push(EnumI { name: e.name.clone(), kind: EKind::User, variants: Vec::new() });
+        }
+    }
+
+    fn collect_enum(&mut self, e: &'a EnumDecl) {
+        if !e.generics.is_empty() {
+            self.unsupported(e.span, "a generic enum");
+            return;
+        }
+        let Some(ei) = self.find_enum(&e.name) else { return };
+        let mut variants = Vec::new();
+        for v in &e.variants {
+            if v.value.is_some() {
+                self.unsupported(v.span, "an enum variant with an explicit value");
+            }
+            let mut fields = Vec::new();
+            for f in &v.fields {
+                match self.type_ct(&f.ty) {
+                    Some(ct) if Self::payload_ok(ct) => fields.push((f.name.clone(), ct)),
+                    _ => self.unsupported(f.ty.span, "this enum payload type (objects inside enums come later)"),
+                }
+            }
+            variants.push(VariantI { name: v.name.clone(), fields });
+        }
+        self.enums[ei].variants = variants;
     }
 
     fn register_type(&mut self, t: &'a TypeDecl) {
@@ -384,7 +565,7 @@ impl<'a> Gen<'a> {
             match it {
                 Item::Namespace(n) => self.collect_items(&n.items, next_class),
                 Item::Import(_) => {}
-                Item::Enum(e) => self.unsupported(e.span, "`enum`"),
+                Item::Enum(e) => self.collect_enum(e),
                 Item::Type(t) => self.collect_type(t, next_class),
             }
         }
@@ -452,7 +633,7 @@ impl<'a> Gen<'a> {
                 }
                 Member::Destructor(d) => self.classes[ci].dtor = Some(d),
                 Member::Type(n) => self.unsupported(n.span, "a nested type"),
-                Member::Enum(e) => self.unsupported(e.span, "`enum`"),
+                Member::Enum(e) => self.unsupported(e.span, "an enum nested in a class"),
             }
         }
     }
@@ -552,6 +733,43 @@ impl<'a> Gen<'a> {
     }
 
     // ------------------------------------------------------- output
+
+    /// Struct definitions of all enums, payload enums first.
+    fn emit_enums(&mut self) {
+        let n = self.enums.len();
+        let mut done = vec![false; n];
+        fn visit(g: &mut Gen, i: usize, done: &mut Vec<bool>) {
+            if done[i] {
+                return;
+            }
+            done[i] = true;
+            let deps: Vec<usize> = g.enums[i]
+                .variants
+                .iter()
+                .flat_map(|v| v.fields.iter())
+                .filter_map(|(_, ct)| if let CT::Enum(j) = ct { Some(*j) } else { None })
+                .collect();
+            for d in deps {
+                visit(g, d, done);
+            }
+            let mut s = format!("typedef struct {{\n    int tag;\n    union {{\n        char pad_;\n");
+            for (vi, v) in g.enums[i].variants.iter().enumerate() {
+                if v.fields.is_empty() {
+                    continue;
+                }
+                s.push_str("        struct { ");
+                for (fname, ct) in &v.fields {
+                    s.push_str(&format!("{} f_{}; ", ct.c(), fname));
+                }
+                s.push_str(&format!("}} v{};\n", vi));
+            }
+            s.push_str(&format!("    }} u;\n}} ioc_e{};\n", i));
+            g.out.push_str(&s);
+        }
+        for i in 0..n {
+            visit(self, i, &mut done);
+        }
+    }
 
     fn emit_struct(&mut self, i: usize) {
         let mut s = format!("struct ioc_c{} {{\n", i);
@@ -747,7 +965,8 @@ impl<'a> Gen<'a> {
         let inits: Vec<(String, &'a Expr)> =
             self.classes[ci].fields.iter().filter_map(|f| f.init.map(|e| (f.name.clone(), e))).collect();
         for (n, e) in inits {
-            if let Some((c, _)) = self.owned_value(e) {
+            let fct = self.classes[ci].fields.iter().find(|f| f.name == n).map(|f| f.ct);
+            if let Some((c, _)) = self.owned_value_as(e, fct) {
                 self.line(&format!("v_this->f_{} = {};", n, c));
             }
         }
@@ -788,7 +1007,7 @@ impl<'a> Gen<'a> {
                         self.discard(c, t);
                     }
                     self.drop_lines(0);
-                } else if let Some(v) = self.owned_value(e) {
+                } else if let Some(v) = self.owned_value_as(e, Some(ret)) {
                     if self.check_owned(ret, v.1, e.span).is_some() {
                         self.emit_return(Some(v));
                     }
@@ -825,7 +1044,7 @@ impl<'a> Gen<'a> {
                     None => None,
                 };
                 let (init_c, init_t) = match init {
-                    Some(e) => match self.owned_value(e) {
+                    Some(e) => match self.owned_value_as(e, declared) {
                         Some((c, t)) => (Some(c), Some(t)),
                         None => return,
                     },
@@ -848,6 +1067,10 @@ impl<'a> Gen<'a> {
                 self.declare(name, ct);
             }
             StmtKind::Expr(e) => {
+                if let ExprKind::Match { scrutinee, arms } = &e.kind {
+                    self.match_gen(scrutinee, arms, false, e.span);
+                    return;
+                }
                 if let Some((c, t)) = self.expr(e) {
                     self.discard(c, t);
                 }
@@ -875,7 +1098,7 @@ impl<'a> Gen<'a> {
                 self.line("}");
             }
             StmtKind::While { cond, body } => {
-                let c = self.expr(cond).map(|x| x.0).unwrap_or_default();
+                let c = self.no_hoist(cond.span, "a `match` or `?` in a loop condition", |g| g.expr(cond)).map(|x| x.0).unwrap_or_default();
                 self.line(&format!("while ({}) {{", c));
                 self.loop_bases.push(self.scopes.len());
                 self.sub(body);
@@ -890,11 +1113,11 @@ impl<'a> Gen<'a> {
                     self.stmt(i);
                 }
                 let c = match cond {
-                    Some(c) => self.expr(c).map(|x| x.0).unwrap_or_default(),
+                    Some(c) => self.no_hoist(c.span, "a `match` or `?` in a loop condition", |g| g.expr(c)).map(|x| x.0).unwrap_or_default(),
                     None => String::new(),
                 };
                 let u = match update {
-                    Some(u) => self.expr(u).map(|x| x.0).unwrap_or_default(),
+                    Some(u) => self.no_hoist(u.span, "a `match` or `?` in a loop update", |g| g.expr(u)).map(|x| x.0).unwrap_or_default(),
                     None => String::new(),
                 };
                 self.line(&format!("for (; {}; {}) {{", c, u));
@@ -909,7 +1132,7 @@ impl<'a> Gen<'a> {
             StmtKind::ForIn { iter, .. } => self.unsupported(iter.span, "`for ... in`"),
             StmtKind::Return(v) => match v {
                 Some(e) => {
-                    if let Some(val) = self.owned_value(e) {
+                    if let Some(val) = self.owned_value_as(e, Some(self.ret)) {
                         if self.check_owned(self.ret, val.1, e.span).is_none() {
                             return;
                         }
@@ -983,7 +1206,7 @@ impl<'a> Gen<'a> {
                 ArgKind::Plain => Some(a.code.clone()),
             };
         }
-        Some(a.code.clone())
+        Some(self.coerce(a.code.clone(), a.ct, param))
     }
 
     fn to_str(&mut self, c: String, t: CT, span: Span) -> Option<String> {
@@ -1069,6 +1292,9 @@ impl<'a> Gen<'a> {
                 if let Some(t) = self.lookup(name) {
                     return Some((format!("v_{}", name), t));
                 }
+                if name == "None" {
+                    return self.builtin_variant("None", Vec::new(), e.span, 2);
+                }
                 // a field of `this`
                 if let (Some(ci), false) = (self.class, self.in_static) {
                     if self.classes[ci].fields.iter().any(|f| f.name == *name) {
@@ -1086,6 +1312,11 @@ impl<'a> Gen<'a> {
                 }
             },
             ExprKind::Member { target, name } => {
+                if let ExprKind::Ident(q) = &target.kind {
+                    if self.lookup(q).is_none() && !self.is_this_field(q) && self.find_enum(q).is_some() {
+                        return self.enum_call(q, name, Vec::new(), e.span);
+                    }
+                }
                 let (c, t) = self.expr(target)?;
                 match (t, name.as_str()) {
                     (CT::Str, "length") => Some((format!("ioc_strlen({})", c), CT::I32)),
@@ -1118,6 +1349,12 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            ExprKind::Binary { op: BinOp::Coalesce, lhs, rhs } => self.coalesce(lhs, rhs, e.span),
+            ExprKind::Binary { op: op @ (BinOp::And | BinOp::Or), lhs, rhs } => {
+                let (lc, _) = self.expr(lhs)?;
+                let (rc, _) = self.no_hoist(rhs.span, "a `match` or `?` on the right of `&&` / `||`", |g| g.expr(rhs))?;
+                Some((format!("({} {} {})", lc, if *op == BinOp::And { "&&" } else { "||" }, rc), CT::Bool))
+            }
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, e.span),
             ExprKind::Assign { op, target, value } => self.assign(*op, target, value),
             ExprKind::Postfix { op, expr } => {
@@ -1147,18 +1384,12 @@ impl<'a> Gen<'a> {
                 self.unsupported(e.span, "`base`");
                 None
             }
-            ExprKind::Try(_) => {
-                self.unsupported(e.span, "the `?` operator (Result/Option)");
-                None
-            }
+            ExprKind::Try(inner) => self.try_expr(inner, e.span),
             ExprKind::Await(_) => {
                 self.unsupported(e.span, "`await`");
                 None
             }
-            ExprKind::Match { .. } => {
-                self.unsupported(e.span, "`match`");
-                None
-            }
+            ExprKind::Match { scrutinee, arms } => self.match_gen(scrutinee, arms, true, e.span),
             ExprKind::Spawn(_) => {
                 self.unsupported(e.span, "`spawn`");
                 None
@@ -1190,7 +1421,12 @@ impl<'a> Gen<'a> {
             self.check_owned(tt, vt, value.span)?;
             return Some((format!("({{ ioc_c{0} *ioc_n = {1}; ioc_drop_{0}({2}); {2} = ioc_n; ioc_n; }})", i, v, var), CT::Ref(i)));
         }
-        let (v, vt) = self.expr(value)?;
+        let saved = self.expect;
+        self.expect = Some(tt);
+        let r = self.expr(value);
+        self.expect = saved;
+        let (v, vt) = r?;
+        let v = if op == AssignOp::Assign { self.coerce(v, vt, tt) } else { v };
         let c = match op {
             AssignOp::Assign => format!("({} = {})", var, v),
             AssignOp::Add if tt == CT::Str => {
@@ -1280,7 +1516,7 @@ impl<'a> Gen<'a> {
     }
 
     /// Pick the best of several candidates (by parameter types) for the given arguments.
-    fn pick(cands: &[(usize, Vec<CT>)], av: &[Arg]) -> Option<usize> {
+    fn pick(&self, cands: &[(usize, Vec<CT>)], av: &[Arg]) -> Option<usize> {
         let mut best: Option<(usize, usize)> = None;
         for (id, params) in cands {
             if params.len() != av.len() {
@@ -1296,6 +1532,8 @@ impl<'a> Gen<'a> {
                     score += 2;
                 } else if pt.is_num() && at.is_num() && (pt.is_float() || !at.is_float()) {
                     score += 1;
+                } else if self.can_store(*pt, at) {
+                    score += 1;
                 } else {
                     ok = false;
                 }
@@ -1310,6 +1548,9 @@ impl<'a> Gen<'a> {
     fn call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> Option<(String, CT)> {
         let av = self.eval_args(args)?;
         match &callee.kind {
+            ExprKind::Ident(name) if matches!(name.as_str(), "Ok" | "Err" | "Some") && self.lookup(name).is_none() => {
+                self.builtin_variant(name, av, span, 1)
+            }
             ExprKind::Ident(name) => match self.class {
                 Some(ci) => self.user_call(ci, name, av, None, span),
                 None => {
@@ -1320,6 +1561,12 @@ impl<'a> Gen<'a> {
             ExprKind::Member { target, name } => {
                 if let ExprKind::Ident(q) = &target.kind {
                     if self.lookup(q).is_none() && !self.is_this_field(q) {
+                        if self.find_enum(q).is_some() {
+                            return self.enum_call(q, name, av, span);
+                        }
+                        if name == "tryParse" && Self::prim_ct(q).is_some() {
+                            return self.try_parse(q, av, span);
+                        }
                         return match q.as_str() {
                             "Console" => self.console(name, av, span),
                             "Math" => self.math(name, av, span),
@@ -1361,7 +1608,7 @@ impl<'a> Gen<'a> {
             .filter(|(_, m)| m.class_idx == ci && m.name == name)
             .map(|(i, m)| (i, m.params.iter().map(|p| p.1).collect()))
             .collect();
-        let Some(i) = Self::pick(&cands, &av) else {
+        let Some(i) = self.pick(&cands, &av) else {
             let cn = self.classes[ci].name.clone();
             self.err(span, format!("the backend found no method `{}.{}` taking these arguments", cn, name));
             return None;
@@ -1402,7 +1649,7 @@ impl<'a> Gen<'a> {
         }
         let cands: Vec<(usize, Vec<CT>)> =
             self.classes[ci].ctors.iter().enumerate().map(|(k, c)| (k, c.params.iter().map(|p| p.1).collect())).collect();
-        let Some(k) = Self::pick(&cands, &av) else {
+        let Some(k) = self.pick(&cands, &av) else {
             let cn = self.classes[ci].name.clone();
             self.err(span, format!("the backend found no constructor of `{}` taking these arguments", cn));
             return None;
@@ -1419,6 +1666,14 @@ impl<'a> Gen<'a> {
     }
 
     fn console(&mut self, name: &str, av: Vec<Arg>, span: Span) -> Option<(String, CT)> {
+        if name == "readLine" && av.is_empty() {
+            let ei = self.option_of(CT::Str)?;
+            let oc = CT::Enum(ei).c();
+            return Some((
+                format!("({{ ioc_string ioc_l = ioc_readline(); ioc_l ? ({oc}){{ .tag = 0, .u.v0 = {{ .f_value = ioc_l }} }} : ({oc}){{ .tag = 1 }}; }})", oc = oc),
+                CT::Enum(ei),
+            ));
+        }
         let f = match name {
             "println" => "ioc_println",
             "print" => "ioc_print",
@@ -1478,6 +1733,370 @@ impl<'a> Gen<'a> {
                 self.unsupported(span, &format!("the method `{}`", name));
                 None
             }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------- enums, match, Result / Option
+
+impl<'a> Gen<'a> {
+    fn fresh(&mut self, prefix: &str) -> String {
+        self.tmp += 1;
+        format!("{}{}", prefix, self.tmp)
+    }
+
+    fn variant_index(&self, ei: usize, name: &str) -> Option<usize> {
+        self.enums[ei].variants.iter().position(|v| v.name == name)
+    }
+
+    /// Convert `code` of type `from` so it can be stored where `to` is expected:
+    /// a plain `T` becomes `Some(T)` for a `T?`.
+    fn coerce(&self, code: String, from: CT, to: CT) -> String {
+        if from == to {
+            return code;
+        }
+        if let CT::Enum(ei) = to {
+            if let EKind::Option(inner) = self.enums[ei].kind {
+                if from == inner || (from.is_num() && inner.is_num()) {
+                    return format!("(({}){{ .tag = 0, .u.v0 = {{ .f_value = ({}){} }} }})", to.c(), inner.c(), code);
+                }
+            }
+        }
+        code
+    }
+
+    fn can_store(&self, param: CT, arg: CT) -> bool {
+        if let CT::Enum(ei) = param {
+            if let EKind::Option(inner) = self.enums[ei].kind {
+                return arg == inner || (arg.is_num() && inner.is_num());
+            }
+        }
+        false
+    }
+
+    /// `Ok(x)`, `Err(x)`, `Some(x)`, `None`, `Enum.Variant`, `Enum.Variant(args)`.
+    fn make_variant(&mut self, ei: usize, vi: usize, args: Vec<Arg>, span: Span) -> Option<(String, CT)> {
+        let fields = self.enums[ei].variants[vi].fields.clone();
+        if fields.len() != args.len() {
+            self.err(span, "wrong number of values for this variant");
+            return None;
+        }
+        let ct = CT::Enum(ei);
+        if fields.is_empty() {
+            return Some((format!("(({}){{ .tag = {} }})", ct.c(), vi), ct));
+        }
+        let mut parts = Vec::new();
+        for (a, (fname, fct)) in args.iter().zip(fields.iter()) {
+            let code = self.coerce(a.code.clone(), a.ct, *fct);
+            parts.push(format!(".f_{} = {}", fname, code));
+        }
+        Some((format!("(({}){{ .tag = {}, .u.v{} = {{ {} }} }})", ct.c(), vi, vi, parts.join(", ")), ct))
+    }
+
+    /// `Ok(..)` / `Err(..)` / `Some(..)` / `None`: the checker resolved the full type.
+    fn builtin_variant(&mut self, name: &str, args: Vec<Arg>, span: Span, tag: u8) -> Option<(String, CT)> {
+        let Some(CT::Enum(ei)) = self.table_ct(span, tag) else {
+            self.err(span, format!("the backend cannot tell which `{}` type this is; add a type annotation", name));
+            return None;
+        };
+        let Some(vi) = self.variant_index(ei, name) else {
+            self.err(span, "unexpected variant");
+            return None;
+        };
+        self.make_variant(ei, vi, args, span)
+    }
+
+    fn enum_call(&mut self, q: &str, name: &str, args: Vec<Arg>, span: Span) -> Option<(String, CT)> {
+        let ei = self.find_enum(q)?;
+        let Some(vi) = self.variant_index(ei, name) else {
+            self.err(span, format!("`{}` has no variant `{}`", q, name));
+            return None;
+        };
+        self.make_variant(ei, vi, args, span)
+    }
+
+    /// `int.tryParse(text)` and friends: returns an `Option`.
+    fn try_parse(&mut self, ty: &str, av: Vec<Arg>, span: Span) -> Option<(String, CT)> {
+        let target = Self::prim_ct(ty)?;
+        if av.len() != 1 || av[0].ct != CT::Str {
+            self.err(span, "tryParse takes one string");
+            return None;
+        }
+        let Some(ei) = self.option_of(target) else {
+            self.unsupported(span, &format!("`{}.tryParse`", ty));
+            return None;
+        };
+        let oc = CT::Enum(ei).c();
+        let tc = target.c();
+        let (fun, wide) = if target.is_float() {
+            ("ioc_try_f64", "double")
+        } else if target.is_unsigned() {
+            ("ioc_try_u64", "uint64_t")
+        } else if target.is_int() {
+            ("ioc_try_i64", "int64_t")
+        } else {
+            self.unsupported(span, &format!("`{}.tryParse`", ty));
+            return None;
+        };
+        let (lo, hi) = if target.is_float() { ("0".to_string(), "0".to_string()) } else { (format!("({})0", wide), "0".into()) };
+        let _ = (lo, hi);
+        let range = match target {
+            CT::I8 => ("-128", "127"),
+            CT::I16 => ("-32768", "32767"),
+            CT::I32 => ("-2147483648LL", "2147483647LL"),
+            CT::I64 => ("(-9223372036854775807LL-1)", "9223372036854775807LL"),
+            CT::U8 => ("0", "255"),
+            CT::U16 => ("0", "65535"),
+            CT::U32 => ("0", "4294967295ULL"),
+            CT::U64 => ("0", "18446744073709551615ULL"),
+            _ => ("0", "0"),
+        };
+        let code = if target.is_float() {
+            format!("({{ {w} ioc_v; {oc} ioc_o; if ({f}({s}, &ioc_v)) {{ ioc_o = ({oc}){{ .tag = 0, .u.v0 = {{ .f_value = ({t})ioc_v }} }}; }} else {{ ioc_o = ({oc}){{ .tag = 1 }}; }} ioc_o; }})", w = wide, oc = oc, f = fun, s = av[0].code, t = tc)
+        } else {
+            format!("({{ {w} ioc_v; {oc} ioc_o; if ({f}({s}, &ioc_v, {lo}, {hi})) {{ ioc_o = ({oc}){{ .tag = 0, .u.v0 = {{ .f_value = ({t})ioc_v }} }}; }} else {{ ioc_o = ({oc}){{ .tag = 1 }}; }} ioc_o; }})", w = wide, oc = oc, f = fun, s = av[0].code, t = tc, lo = range.0, hi = range.1)
+        };
+        Some((code, CT::Enum(ei)))
+    }
+
+    /// Run `f`; refuse if it had to emit statements first (it would run once instead of every time).
+    fn no_hoist<T>(&mut self, span: Span, what: &str, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        let before = self.out.len();
+        let r = f(self);
+        if self.out.len() != before {
+            self.unsupported(span, what);
+            return None;
+        }
+        r
+    }
+
+    /// `x?` : unwrap a Result / Option, or return early with the failure.
+    fn try_expr(&mut self, inner: &Expr, span: Span) -> Option<(String, CT)> {
+        let (c, t) = self.expr(inner)?;
+        let CT::Enum(ei) = t else {
+            self.unsupported(span, "`?` on this value");
+            return None;
+        };
+        let tmp = self.fresh("ioc_t");
+        self.line(&format!("{} {} = {};", t.c(), tmp, c));
+        let ret = self.ret;
+        match (self.enums[ei].kind.clone(), ret) {
+            (EKind::Result(ok, _), CT::Enum(ri)) if matches!(self.enums[ri].kind, EKind::Result(..)) => {
+                self.line(&format!("if ({}.tag == 1) {{", tmp));
+                self.ind += 1;
+                let r = format!("(({}){{ .tag = 1, .u.v1 = {{ .f_error = {}.u.v1.f_error }} }})", ret.c(), tmp);
+                self.emit_return(Some((r, ret)));
+                self.ind -= 1;
+                self.line("}");
+                Some((format!("{}.u.v0.f_value", tmp), ok))
+            }
+            (EKind::Option(inner_ct), CT::Enum(ri)) if matches!(self.enums[ri].kind, EKind::Option(_)) => {
+                self.line(&format!("if ({}.tag == 1) {{", tmp));
+                self.ind += 1;
+                let r = format!("(({}){{ .tag = 1 }})", ret.c());
+                self.emit_return(Some((r, ret)));
+                self.ind -= 1;
+                self.line("}");
+                Some((format!("{}.u.v0.f_value", tmp), inner_ct))
+            }
+            _ => {
+                self.unsupported(span, "`?` in a method that does not return a matching Result / Option");
+                None
+            }
+        }
+    }
+
+    /// `a ?? b` where `a` is an Option.
+    fn coalesce(&mut self, l: &Expr, r: &Expr, span: Span) -> Option<(String, CT)> {
+        let (lc, lt) = self.expr(l)?;
+        let CT::Enum(ei) = lt else {
+            self.unsupported(span, "`??` on this value");
+            return None;
+        };
+        let EKind::Option(inner) = self.enums[ei].kind.clone() else {
+            self.unsupported(span, "`??` on a Result");
+            return None;
+        };
+        let tmp = self.fresh("ioc_t");
+        self.line(&format!("{} {} = {};", lt.c(), tmp, lc));
+        if let ExprKind::Return(v) = &r.kind {
+            self.line(&format!("if ({}.tag == 1) {{", tmp));
+            self.ind += 1;
+            match v {
+                Some(e) => {
+                    let rt = self.ret;
+                    let val = self.owned_value_as(e, Some(rt))?;
+                    self.emit_return(Some(val));
+                }
+                None => self.emit_return(None),
+            }
+            self.ind -= 1;
+            self.line("}");
+            return Some((format!("{}.u.v0.f_value", tmp), inner));
+        }
+        let (rc, rt) = self.no_hoist(span, "a `match` or `?` on the right of `??`", |g| g.expr(r))?;
+        let rc = self.coerce(rc, rt, inner);
+        Some((format!("({}.tag == 0 ? {}.u.v0.f_value : ({}))", tmp, tmp, rc), inner))
+    }
+
+    /// Test + bindings for a pattern against the value `val` (a C lvalue) of type `ct`.
+    fn pattern(&mut self, p: &Pattern, val: &str, ct: CT) -> Option<(String, Vec<(String, String, CT)>)> {
+        match &p.kind {
+            PatternKind::Wildcard => Some(("1".into(), vec![])),
+            PatternKind::Literal(e) => {
+                let (lc, lt) = self.expr(e)?;
+                let cond = if lt == CT::Str { format!("ioc_streq({}, {})", val, lc) } else { format!("({} == {})", val, lc) };
+                Some((cond, vec![]))
+            }
+            PatternKind::Binding(name) => {
+                if let CT::Enum(ei) = ct {
+                    if let Some(vi) = self.variant_index(ei, name) {
+                        if self.enums[ei].variants[vi].fields.is_empty() {
+                            return Some((format!("({}.tag == {})", val, vi), vec![]));
+                        }
+                    }
+                }
+                Some(("1".into(), vec![(name.clone(), val.to_string(), ct)]))
+            }
+            PatternKind::Path(path) | PatternKind::Variant { path, .. } => {
+                let CT::Enum(ei) = ct else {
+                    self.unsupported(p.span, "this pattern");
+                    return None;
+                };
+                let vname = path.last()?.as_str();
+                let Some(vi) = self.variant_index(ei, vname) else {
+                    self.err(p.span, format!("no variant `{}` here", vname));
+                    return None;
+                };
+                let mut conds = vec![format!("({}.tag == {})", val, vi)];
+                let mut binds = Vec::new();
+                if let PatternKind::Variant { args, .. } = &p.kind {
+                    let fields = self.enums[ei].variants[vi].fields.clone();
+                    for (sub, (fname, fct)) in args.iter().zip(fields.iter()) {
+                        let sub_val = format!("{}.u.v{}.f_{}", val, vi, fname);
+                        let (c, b) = self.pattern(sub, &sub_val, *fct)?;
+                        if c != "1" {
+                            conds.push(c);
+                        }
+                        binds.extend(b);
+                    }
+                }
+                Some((conds.join(" && "), binds))
+            }
+        }
+    }
+
+    /// `match`: used as a statement (`want == false`) or for its value. Statements are emitted in place.
+    fn match_gen(&mut self, scrut: &Expr, arms: &[MatchArm], want: bool, span: Span) -> Option<(String, CT)> {
+        let (sc, st) = self.expr(scrut)?;
+        if matches!(st, CT::Obj(_) | CT::Ref(_) | CT::StrArr | CT::Void) {
+            self.unsupported(span, "`match` on this kind of value");
+            return None;
+        }
+        let m = self.fresh("ioc_m");
+        let done = self.fresh("ioc_done");
+        let res = self.fresh("ioc_res");
+        let res_pos = self.out.len();
+        let mut res_ct: Option<CT> = if want { self.expect } else { None };
+        if let Some(c) = res_ct {
+            self.line(&format!("{} {};", c.c(), res));
+        }
+        self.line("{");
+        self.ind += 1;
+        self.line(&format!("{} {} = {};", st.c(), m, sc));
+        let saved_expect = self.expect;
+        for arm in arms {
+            self.push_scope();
+            let (cond, binds) = self.pattern(&arm.pattern, &m, st)?;
+            self.line(&format!("if ({}) {{", cond));
+            self.ind += 1;
+            for (n, code, ct) in &binds {
+                self.line(&format!("{} v_{} = {};", ct.c(), n, code));
+                self.declare(n, *ct);
+            }
+            if let Some(g) = &arm.guard {
+                let gc = self.no_hoist(g.span, "a `match` or `?` inside a guard", |x| x.expr(g))?.0;
+                self.line(&format!("if ({}) {{", gc));
+                self.ind += 1;
+            }
+            self.expect = res_ct;
+            match &arm.body.kind {
+                ExprKind::Block(b) => {
+                    self.line("{");
+                    self.ind += 1;
+                    self.push_scope();
+                    for x in &b.stmts {
+                        self.stmt(x);
+                    }
+                    self.pop_scope();
+                    self.ind -= 1;
+                    self.line("}");
+                }
+                ExprKind::Return(v) => match v {
+                    Some(e) => {
+                        let rt = self.ret;
+                        if let Some(val) = self.owned_value_as(e, Some(rt)) {
+                            self.emit_return(Some(val));
+                        }
+                    }
+                    None => self.emit_return(None),
+                },
+                _ if want => {
+                    if let Some((c, t)) = self.expr(&arm.body) {
+                        if t != CT::Void {
+                            let target = match res_ct {
+                                Some(r) => r,
+                                None => {
+                                    res_ct = Some(t);
+                                    let decl = format!("{} {};\n", t.c(), res);
+                                    self.out.insert_str(res_pos, &decl);
+                                    t
+                                }
+                            };
+                            let c = self.coerce(c, t, target);
+                            self.line(&format!("{} = {};", res, c));
+                        } else {
+                            self.line(&format!("{};", c));
+                        }
+                    }
+                }
+                _ => {
+                    if let Some((c, t)) = self.expr(&arm.body) {
+                        self.discard(c, t);
+                    }
+                }
+            }
+            self.line(&format!("goto {};", done));
+            if arm.guard.is_some() {
+                self.ind -= 1;
+                self.line("}");
+            }
+            self.ind -= 1;
+            self.line("}");
+            self.pop_scope();
+        }
+        self.expect = saved_expect;
+        self.line("ioc_panic(\"no match arm matched\");");
+        self.line(&format!("{}:;", done));
+        self.ind -= 1;
+        self.line("}");
+        match (want, res_ct) {
+            (true, Some(c)) => Some((res, c)),
+            _ => Some(("((void)0)".into(), CT::Void)),
+        }
+    }
+
+    /// Like `owned_value`, with the type the value will be stored as (for `T?` wrapping and `None`).
+    fn owned_value_as(&mut self, e: &Expr, expected: Option<CT>) -> Option<(String, CT)> {
+        let saved = self.expect;
+        self.expect = expected;
+        let r = self.owned_value(e);
+        self.expect = saved;
+        let (c, t) = r?;
+        match expected {
+            Some(to) => Some((self.coerce(c, t, to), to.max_with(t))),
+            None => Some((c, t)),
         }
     }
 }

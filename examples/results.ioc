@@ -1,0 +1,85 @@
+// Iocaste v0.0.8-alpha: no exceptions, no null. Failure is a value.
+//   ioc run examples/results.ioc
+namespace Results;
+
+import Ioc.Console;
+
+public enum ParseError {
+    Empty,
+    NotANumber(text: string),
+    OutOfRange(value: int),
+}
+
+public enum Shape {
+    Circle(radius: double),
+    Rect(w: double, h: double),
+    Dot,
+}
+
+public class Program {
+    static parseAge(text: string): Result<int, ParseError> {
+        if (text.isEmpty()) { return Err(ParseError.Empty); }
+        let n = int.tryParse(text) ?? return Err(ParseError.NotANumber(text));
+        if (n < 0 || n > 150) { return Err(ParseError.OutOfRange(n)); }
+        return Ok(n);
+    }
+
+    static describe(e: ParseError): string {
+        return match (e) {
+            Empty => "nothing was typed",
+            NotANumber(t) => $"'{t}' is not a number",
+            OutOfRange(v) => $"{v} is not a believable age",
+        };
+    }
+
+    static nextYear(text: string): Result<int, ParseError> {
+        let age = parseAge(text)?;          // `?` returns the error early
+        return Ok(age + 1);
+    }
+
+    static area(s: Shape): double {
+        return match (s) {
+            Circle(r) => 3.14159 * r * r,
+            Rect(w, h) => w * h,
+            Dot => 0.0,
+        };
+    }
+
+    static firstEven(limit: int): int? {
+        for (var i = 1; i <= limit; i++) {
+            if (i % 2 == 0) { return i; }   // a plain value becomes Some(i)
+        }
+        return None;
+    }
+
+    public static main(args: string[]): int {
+        Console.println(check("42"));
+        Console.println(check(""));
+        Console.println(check("abc"));
+        Console.println(check("200"));
+
+        match (nextYear("41")) {
+            Ok(v) => Console.println($"next year: {v}"),
+            Err(e) => Console.println(describe(e)),
+        }
+        match (nextYear("x1")) {
+            Ok(v) => Console.println($"next year: {v}"),
+            Err(e) => Console.println(describe(e)),
+        }
+
+        Console.println($"{area(Shape.Circle(2.0))} {area(Shape.Rect(3.0, 4.0))} {area(Shape.Dot)}");
+
+        let e = firstEven(7) ?? -1;
+        let none = firstEven(1) ?? -1;
+        Console.println($"first even: {e}, none: {none}");
+        return 0;
+    }
+
+    static check(text: string): string {
+        match (parseAge(text)) {
+            Ok(age) if age >= 18 => return $"{age}: adult",
+            Ok(age) => return $"{age}: minor",
+            Err(e) => return describe(e),
+        }
+    }
+}

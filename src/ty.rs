@@ -127,6 +127,17 @@ impl Prim {
     }
 }
 
+/// A fully resolved type, by name: what the checker hands to the code generator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TyInfo {
+    Prim(String),
+    Named(String, Vec<TyInfo>),
+    Array(Box<TyInfo>),
+    Ref(Box<TyInfo>),
+    Void,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// An error was already reported; suppresses follow-up errors.
