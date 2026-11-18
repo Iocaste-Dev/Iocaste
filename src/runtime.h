@@ -1,4 +1,4 @@
-/* Iocaste runtime v0.0.5-alpha (generated programs include this text verbatim) */
+/* Iocaste runtime v0.0.8-alpha (generated programs include this text verbatim) */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include <errno.h>
 
 typedef const char *ioc_string;
 typedef struct { int64_t length; ioc_string *items; } ioc_strarr;
@@ -147,3 +148,46 @@ static void *ioc_zalloc(size_t n) {
     return p;
 }
 #define IOC_TAKE(p) ({ __typeof__(p) ioc_t_ = (p); (p) = NULL; ioc_t_; })
+
+/* ---- parsing and input (v0.0.8) */
+static bool ioc_try_i64(ioc_string s, int64_t *out, long long lo, long long hi) {
+    if (!*s) return false;
+    char *end;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno || *end || v < lo || v > hi) return false;
+    *out = v;
+    return true;
+}
+static bool ioc_try_u64(ioc_string s, uint64_t *out, unsigned long long lo, unsigned long long hi) {
+    if (!*s || *s == '-') return false;
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || *end || v < lo || v > hi) return false;
+    *out = v;
+    return true;
+}
+static bool ioc_try_f64(ioc_string s, double *out) {
+    if (!*s) return false;
+    char *end;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno || *end) return false;
+    *out = v;
+    return true;
+}
+static ioc_string ioc_readline(void) {
+    size_t cap = 128, n = 0;
+    char *b = (char *)ioc_alloc(cap);
+    int c;
+    while ((c = fgetc(stdin)) != EOF) {
+        if (c == '\n') break;
+        if (n + 2 > cap) { cap *= 2; char *nb = (char *)ioc_alloc(cap); memcpy(nb, b, n); free(b); b = nb; }
+        b[n++] = (char)c;
+    }
+    if (c == EOF && n == 0) { free(b); return NULL; }
+    if (n > 0 && b[n - 1] == '\r') n--;
+    b[n] = 0;
+    return b;
+}

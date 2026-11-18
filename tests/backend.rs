@@ -8,11 +8,11 @@ fn have_cc() -> bool {
 
 fn compile(src: &str) -> Result<String, String> {
     let ast = parser::parse(src).map_err(|d| d.message)?;
-    let errs = sema::analyze(&[&ast]);
+    let (errs, types) = sema::analyze_full(&[&ast]);
     if let Some(e) = errs.first() {
         return Err(format!("check: {}", e.diag.message));
     }
-    cgen::generate(&[&ast]).map_err(|e| format!("cgen: {}", e[0].diag.message))
+    cgen::generate(&[&ast], &types).map_err(|e| format!("cgen: {}", e[0].diag.message))
 }
 
 static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -133,7 +133,7 @@ fn args_are_available() {
 
 #[test]
 fn unsupported_features_get_a_clear_error() {
-    let e = compile("namespace T;\npublic enum E { A, B }\npublic class P { public static main(): int { return 0; } }").unwrap_err();
+    let e = compile("namespace T;\npublic interface I { f(): int; }\npublic class P { public static main(): int { return 0; } }").unwrap_err();
     assert!(e.contains("not supported by the C backend"), "{}", e);
 }
 
@@ -275,4 +275,95 @@ fn returning_this_by_value_is_a_check_error() {
     let ast = parser::parse(src).unwrap();
     let errs = sema::analyze(&[&ast]);
     assert!(errs.iter().any(|e| e.diag.message.contains("cannot move `this`")), "{:?}", errs.iter().map(|e| &e.diag.message).collect::<Vec<_>>());
+}
+
+// ------------------------------------------------------------------ enums, match, Result / Option (v0.0.8)
+
+#[test]
+fn results_example() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/results.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(
+        out,
+        "42: adult\nnothing was typed\n'abc' is not a number\n200 is not a believable age\nnext year: 42\n'x1' is not a number\n12.56636 12 0\nfirst even: 2, none: -1\n"
+    );
+}
+
+fn plain(body: &str, extra: &str) -> String {
+    program(body, extra)
+}
+
+#[test]
+fn enum_variants_and_match_with_literals_and_guards() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&plain(
+        "Console.println($\"{name(Color.Red)} {name(Color.Rgb(1, 2, 3))} {kind(0)} {kind(7)} {kind(-4)} {word(\"hi\")} {word(\"yo\")}\");",
+        "static name(c: Color): string { return match (c) { Red => \"red\", Rgb(r, g, b) => $\"rgb {r + g + b}\" }; }
+         static kind(n: int): string { return match (n) { 0 => \"zero\", x if x > 0 => \"pos\", _ => \"neg\" }; }
+         static word(s: string): string { return match (s) { \"hi\" => \"hello\", _ => \"?\" }; }",
+    ).replace("public class P {", "public enum Color { Red, Rgb(r: int, g: int, b: int) }\npublic class P {"));
+    assert_eq!(out, "red rgb 6 zero pos neg hello ?\n");
+}
+
+#[test]
+fn option_wraps_plain_values_and_coalesce_unwraps() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&plain(
+        "let a = find(3); let b = find(-1); Console.println($\"{a ?? 0} {b ?? 99} {count(a)} {count(b)}\");",
+        "static find(n: int): int? { if (n > 0) { return n * 2; } return None; }
+         static count(o: int?): int { return match (o) { Some(v) => v, None => -1 }; }",
+    ));
+    assert_eq!(out, "6 99 6 -1\n");
+}
+
+#[test]
+fn question_mark_returns_the_error_early() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&plain(
+        "Console.println(show(add(\"1\", \"2\"))); Console.println(show(add(\"1\", \"x\"))); Console.println(show(add(\"y\", \"2\")));",
+        "static num(s: string): Result<int, string> { let n = int.tryParse(s) ?? return Err($\"bad {s}\"); return Ok(n); }
+         static add(a: string, b: string): Result<int, string> { let x = num(a)?; let y = num(b)?; return Ok(x + y); }
+         static show(r: Result<int, string>): string { return match (r) { Ok(v) => $\"ok {v}\", Err(e) => $\"err {e}\" }; }",
+    ));
+    assert_eq!(out, "ok 3\nerr bad x\nerr bad y\n");
+}
+
+#[test]
+fn try_parse_checks_the_whole_text_and_the_range() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&plain(
+        "Console.println($\"{int.tryParse(\"12\") ?? -1} {int.tryParse(\"12x\") ?? -1} {int.tryParse(\"\") ?? -1} {int.tryParse(\"99999999999\") ?? -1} {long.tryParse(\"-5\") ?? 7} {double.tryParse(\"2.5\") ?? 0.0}\");",
+        "",
+    ));
+    assert_eq!(out, "12 -1 -1 -1 -5 2.5\n");
+}
+
+#[test]
+fn enums_inside_enums_and_nested_patterns() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&plain(
+        "Console.println($\"{f(Some(5))} {f(None)} {g(Ok(Some(2)))} {g(Ok(None))} {g(Err(\"e\"))}\");",
+        "static f(o: int?): int { return match (o) { Some(5) => 50, Some(_) => 1, None => 0 }; }
+         static g(r: Result<int?, string>): string { return match (r) { Ok(Some(v)) => $\"v{v}\", Ok(None) => \"none\", Err(e) => e }; }",
+    ));
+    assert_eq!(out, "50 0 v2 none e\n");
+}
+
+#[test]
+fn match_as_a_statement_with_blocks() {
+    if !have_cc() { return; }
+    let (_, out, _) = run_asan(&plain(
+        "var total = 0; for (var i = 0; i < 4; i++) { match (i % 3) { 0 => { total += 100; } 1 => total += 10, _ => { total += 1; } } } Console.println(total.toString());",
+        "",
+    ));
+    assert_eq!(out, "211\n");
+}
+
+#[test]
+fn objects_inside_enums_are_refused_for_now() {
+    let src = "namespace T;\npublic class A { }\npublic enum E { X(a: A) }\npublic class P { public static main(): int { return 0; } }";
+    let e = compile(src).unwrap_err();
+    assert!(e.contains("not supported by the C backend"), "{}", e);
 }

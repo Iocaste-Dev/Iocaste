@@ -209,6 +209,8 @@ pub struct Program<'a> {
     pub lang: Lang,
     pub errors: Vec<SemaError>,
     pub prelude_file: usize,
+    /// Resolved types of calls / names / members, for the code generator: (file, line, col, tag).
+    pub type_table: std::cell::RefCell<HashMap<(usize, u32, u32, u8), TyInfo>>,
     imports: Vec<(usize, Vec<String>, Span)>,
 }
 
@@ -238,6 +240,7 @@ impl<'a> Program<'a> {
             lang: Lang { option: NONE, result: NONE, shared: NONE, task: NONE, iterable: NONE, list: NONE },
             errors: Vec::new(),
             prelude_file,
+            type_table: Default::default(),
             imports: Vec::new(),
         }
     }

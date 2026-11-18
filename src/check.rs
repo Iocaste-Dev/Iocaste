@@ -138,9 +138,12 @@ enum MutKind {
     Borrow,
 }
 
+#[derive(Clone)]
 enum PatCover {
     All,
     Variant(usize),
+    /// a variant whose payload patterns are not all catch-alls (`Ok(Some(x))`)
+    Partial(usize, Vec<PatCover>),
     Bool(bool),
     Nothing,
 }
@@ -160,6 +163,7 @@ struct Checker<'p, 'a> {
     loops: usize,
     all_locals: Vec<(String, Ty, Span)>,
     // ---- ownership tracking (v0.0.4)
+    rec: Vec<((u32, u32, u8), Ty)>,
     next_id: usize,
     moved: HashMap<usize, Span>,
     loans: Vec<Loan>,
@@ -377,6 +381,7 @@ impl<'p, 'a> Checker<'p, 'a> {
             infer: Vec::new(),
             loops: 0,
             all_locals: Vec::new(),
+            rec: Vec::new(),
             next_id: 0,
             moved: HashMap::new(),
             loans: Vec::new(),
@@ -396,6 +401,15 @@ impl<'p, 'a> Checker<'p, 'a> {
             }
         }
         let file = self.file;
+        let rec = std::mem::take(&mut self.rec);
+        for (key, ty) in rec {
+            if let Ty::Named { id, .. } = self.resolve(&ty) {
+                if id == self.prog.lang.option || id == self.prog.lang.result {
+                    let info = self.to_info(&ty);
+                    self.prog.type_table.borrow_mut().insert((file, key.0, key.1, key.2), info);
+                }
+            }
+        }
         let mut seen: HashSet<(u32, u32, String)> = HashSet::new();
         self.diags
             .into_iter()
@@ -1184,6 +1198,32 @@ impl<'p, 'a> Checker<'p, 'a> {
     }
 
     fn expr(&mut self, e: &Expr, exp: Option<&Ty>) -> Ty {
+        let t = self.expr_inner(e, exp);
+        let tag = match &e.kind {
+            ExprKind::Call { .. } => 1,
+            ExprKind::Ident(_) => 2,
+            ExprKind::Member { .. } => 3,
+            _ => 0,
+        };
+        if tag != 0 {
+            self.rec.push(((e.span.line, e.span.col, tag), t.clone()));
+        }
+        t
+    }
+
+    fn to_info(&self, t: &Ty) -> TyInfo {
+        let prog = self.prog;
+        match self.resolve(t) {
+            Ty::Prim(p) => TyInfo::Prim(p.name().to_string()),
+            Ty::Named { id, args } => TyInfo::Named(prog.types[id].name.clone(), args.iter().map(|a| self.to_info(a)).collect()),
+            Ty::Array(i) => TyInfo::Array(Box::new(self.to_info(&i))),
+            Ty::Ref { inner, .. } => TyInfo::Ref(Box::new(self.to_info(&inner))),
+            Ty::Void => TyInfo::Void,
+            _ => TyInfo::Unknown,
+        }
+    }
+
+    fn expr_inner(&mut self, e: &Expr, exp: Option<&Ty>) -> Ty {
         match &e.kind {
             ExprKind::Int { suffix, .. } => self.int_lit(suffix, exp),
             ExprKind::Float { suffix, .. } => self.float_lit(suffix, exp),
@@ -2481,20 +2521,74 @@ impl<'p, 'a> Checker<'p, 'a> {
                     }
                     return PatCover::Nothing;
                 }
-                let mut irrefutable = true;
+                let mut subs = Vec::new();
                 for (a, f) in args.iter().zip(v.fields.iter()) {
                     let ft = subst(&f.ty, &map);
-                    if !matches!(self.pattern(a, &ft), PatCover::All) {
-                        irrefutable = false;
-                    }
+                    subs.push(self.pattern(a, &ft));
                 }
-                if irrefutable {
+                if subs.iter().all(|c| matches!(c, PatCover::All)) {
                     PatCover::Variant(idx)
                 } else {
-                    PatCover::Nothing
+                    PatCover::Partial(idx, subs)
                 }
             }
         }
+    }
+
+    /// Do the (unguarded) arms cover every value of `ty`?
+    fn is_exhaustive(&mut self, covers: &[(PatCover, bool)], ty: &Ty) -> bool {
+        if covers.iter().any(|(c, g)| !*g && matches!(c, PatCover::All)) {
+            return true;
+        }
+        let ty = self.resolve(ty);
+        let prog = self.prog;
+        match &ty {
+            Ty::Named { id, args } if prog.types[*id].kind == DefKind::Enum => {
+                (0..prog.types[*id].variants.len()).all(|i| self.variant_covered(*id, args, i, covers))
+            }
+            Ty::Prim(Prim::Bool) => {
+                let has = |b: bool| covers.iter().any(|(c, g)| !*g && matches!(c, PatCover::Bool(x) if *x == b));
+                has(true) && has(false)
+            }
+            _ => false,
+        }
+    }
+
+    fn variant_covered(&mut self, eid: TypeId, args: &[Ty], i: usize, covers: &[(PatCover, bool)]) -> bool {
+        if covers.iter().any(|(c, g)| !*g && matches!(c, PatCover::Variant(x) if *x == i)) {
+            return true;
+        }
+        let partials: Vec<&Vec<PatCover>> = covers
+            .iter()
+            .filter(|(_, g)| !*g)
+            .filter_map(|(c, _)| match c {
+                PatCover::Partial(x, subs) if *x == i => Some(subs),
+                _ => None,
+            })
+            .collect();
+        if partials.is_empty() {
+            return false;
+        }
+        // supported shape: at most one payload position is refutable (`Ok(Some(x))` / `Ok(None)`)
+        let mut pos: Option<usize> = None;
+        for p in &partials {
+            for (j, c) in p.iter().enumerate() {
+                if !matches!(c, PatCover::All) {
+                    match pos {
+                        None => pos = Some(j),
+                        Some(q) if q == j => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        let Some(j) = pos else { return true };
+        let prog = self.prog;
+        let def = &prog.types[eid];
+        let map = prog.param_map(def, &args.to_vec());
+        let ft = subst(&def.variants[i].fields[j].ty, &map);
+        let subs: Vec<(PatCover, bool)> = partials.iter().map(|p| (p[j].clone(), false)).collect();
+        self.is_exhaustive(&subs, &ft)
     }
 
     /// Make sure the matched value really is of the enum the pattern names.
@@ -2560,17 +2654,12 @@ impl<'p, 'a> Checker<'p, 'a> {
             if !catch_all {
                 let prog = self.prog;
                 match &rs {
-                    Ty::Named { id, .. } if prog.types[*id].kind == DefKind::Enum => {
-                        let covered: HashSet<usize> = covers
-                            .iter()
-                            .filter(|(_, g)| !*g)
-                            .filter_map(|(c, _)| if let PatCover::Variant(i) = c { Some(*i) } else { None })
-                            .collect();
+                    Ty::Named { id, args } if prog.types[*id].kind == DefKind::Enum => {
                         let missing: Vec<String> = prog.types[*id]
                             .variants
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| !covered.contains(i))
+                            .filter(|(i, _)| !self.variant_covered(*id, args, *i, &covers))
                             .map(|(_, v)| format!("`{}`", v.name))
                             .collect();
                         if !missing.is_empty() {
