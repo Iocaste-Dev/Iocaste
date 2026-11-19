@@ -164,6 +164,7 @@ struct Checker<'p, 'a> {
     all_locals: Vec<(String, Ty, Span)>,
     // ---- ownership tracking (v0.0.4)
     rec: Vec<((u32, u32, u8), Ty)>,
+    base_call_span: Option<Span>,
     next_id: usize,
     moved: HashMap<usize, Span>,
     loans: Vec<Loan>,
@@ -382,6 +383,7 @@ impl<'p, 'a> Checker<'p, 'a> {
             loops: 0,
             all_locals: Vec::new(),
             rec: Vec::new(),
+            base_call_span: None,
             next_id: 0,
             moved: HashMap::new(),
             loans: Vec::new(),
@@ -927,8 +929,83 @@ impl<'p, 'a> Checker<'p, 'a> {
         self.ret.push(RetCtx { ret: Ty::Void });
         self.push_scope();
         self.declare_params(&c.params, &d.params);
+        let first_is_base = matches!(
+            d.body.stmts.first().map(|s| &s.kind),
+            Some(StmtKind::Expr(Expr { kind: ExprKind::Call { callee, .. }, .. })) if matches!(callee.kind, ExprKind::Base)
+        );
+        if first_is_base {
+            if let Some(StmtKind::Expr(e)) = d.body.stmts.first().map(|s| &s.kind) {
+                self.base_call_span = Some(e.span);
+            }
+        } else if let Some((bid, _)) = self.base_class() {
+            // an implicit `base()`: the base class needs a constructor that takes no arguments
+            let bd = &self.prog.types[bid];
+            if !bd.ctors.is_empty() && !bd.ctors.iter().any(|k| k.params.iter().all(|p| p.has_default)) {
+                let msg = format!("the base class `{}` has no constructor without arguments", bd.name);
+                self.err_hint(d.span, msg, "start this constructor with `base(...)` to choose one");
+            }
+        }
         self.block(&d.body);
+        self.base_call_span = None;
         self.pop_scope();
+    }
+
+    /// The base class (not interface) of the class being checked.
+    fn base_class(&self) -> Option<(TypeId, Ty)> {
+        let prog = self.prog;
+        for b in &prog.types[self.tid].bases {
+            if let Ty::Named { id, .. } = b {
+                if prog.types[*id].kind == DefKind::Class {
+                    return Some((*id, b.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// `base(args)` as the first statement of a constructor.
+    fn base_ctor_call(&mut self, args: &[Expr], span: Span) -> Ty {
+        let prog = self.prog;
+        let ok_place = self.in_ctor && self.base_call_span == Some(span);
+        let Some((bid, bty)) = self.base_class() else {
+            self.err_hint(span, "this class has no base class", "`base(...)` calls the constructor of the class after the `:`");
+            for a in args {
+                self.expr(a, None);
+            }
+            return Ty::Error;
+        };
+        if !ok_place {
+            self.err_hint(span, "`base(...)` must be the first statement of a constructor", "move it to the top of the constructor");
+        }
+        let Ty::Named { args: bargs, .. } = &bty else { return Ty::Void };
+        let cd = &prog.types[bid];
+        let map = prog.param_map(cd, bargs);
+        let cands: Vec<Cand> = cd
+            .ctors
+            .iter()
+            .map(|c| Cand {
+                params: c.params.iter().map(|p| (subst(&p.ty, &map), p.has_default)).collect(),
+                generics: Vec::new(),
+                ret: bty.clone(),
+                is_static: false,
+                vis: c.vis,
+                owner: bid,
+            })
+            .collect();
+        if cands.is_empty() {
+            if !args.is_empty() {
+                self.err(span, format!("`{}` has no constructor that takes arguments", cd.name));
+            }
+            for a in args {
+                self.expr(a, None);
+            }
+            return Ty::Void;
+        }
+        if let Some((_, i)) = self.resolve_call(&cd.name, &cands, args, span, None) {
+            let (vis, owner) = (cands[i].vis, cands[i].owner);
+            self.check_access(vis, owner, span, &format!("the constructor of `{}`", cd.name));
+        }
+        Ty::Void
     }
 
     fn property(&mut self, p: &PropInfo, d: &PropertyDecl) {
@@ -1746,6 +1823,10 @@ impl<'p, 'a> Checker<'p, 'a> {
     // -------------------------------------------------------------- calls
 
     fn call(&mut self, callee: &Expr, args: &[Expr], span: Span, exp: Option<&Ty>) -> Ty {
+        if let ExprKind::Base = callee.kind {
+            let t = self.base_ctor_call(args, span);
+            return t;
+        }
         match self.classify(callee) {
             Res::Methods { name, recv, implicit, base_call, cands } => {
                 self.call_methods(&name, recv, implicit, base_call, cands, args, span, exp)

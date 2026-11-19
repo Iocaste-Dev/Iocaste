@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.0.9-alpha (Step 9): inheritance, interfaces, and a self-contained toolchain
+
+**No C compiler needed any more.** The first `ioc build` / `ioc run` on a machine without a compiler downloads one (Zig 0.13.0, pinned) into `~/.ioc/toolchain` and uses it from then on. No admin rights, nothing to install by hand. `ioc install --toolchain` does the same step on demand.
+- Order of choice: `IOC_CC`, config `cc`, the managed compiler, then a system `cc`/`gcc`/`clang`.
+- `IOC_TOOLCHAIN_URL` points the download at a mirror or an offline archive; `IOC_NO_DOWNLOAD` forbids downloading.
+- The download is checked only by HTTPS to ziglang.org (no checksum pin yet; that is on the list).
+
+Object-oriented backend:
+- **Inheritance** (`class Dog : Animal`): fields and methods are inherited; a derived object is usable wherever its base is expected (`ref Animal`, a field of type `Animal`).
+- **Virtual calls**: `virtual` / `override` / `abstract` dispatch on the object's real class.
+- **Interfaces** (`interface Named { name(): string; }`): a `ref Named` calls the implementing class's method.
+- **`base(args)`** must be the first statement of a constructor (new rule, checked by `ioc check`); a base without a no-argument constructor requires it. **`base.method(args)`** calls the base implementation.
+- **Destruction**: destructors run derived class first, then base; owned fields are freed; an object held as its base type is freed as its real class, exactly once (checked under AddressSanitizer).
+- Abstract classes and interfaces cannot be created with `new`.
+- New example: `examples/shapes.ioc`.
+
+Still for v0.1.0: generics (`hello.ioc` / `typed.ioc` need them to build), `shared<T>`, tasks and channels, objects inside collections and enums.
+
 ## v0.0.8-alpha (Step 8): enums, match, Result / Option
 
 Error handling without exceptions or `null` now compiles and runs.

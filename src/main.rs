@@ -88,7 +88,7 @@ COMMANDS:
 
 `ioc help <command>` explains one command.
 
-Coming next: inheritance and interfaces in the backend (v0.0.9)."
+Coming next: generics, tasks and channels (v0.1.0)."
     );
 }
 
@@ -264,9 +264,16 @@ fn build(args: &[String]) -> Result<PathBuf, i32> {
         return Ok(c_path);
     }
     let exe = dir.join(if cfg!(windows) { format!("{}.exe", name) } else { name.clone() });
-    let cc = commands::detect_cc().map(|c| c.cmd).unwrap_or_else(|| "cc".into());
+    let cc = match commands::cc_or_provision() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ioc: no compiler: {}", e);
+            return Err(2);
+        }
+    };
     let opt: &[&str] = if args.iter().any(|a| a == "--debug") { &["-O0", "-g"] } else { &["-O2"] };
-    let out = std::process::Command::new(&cc)
+    let out = std::process::Command::new(&cc.cmd)
+        .args(&cc.pre)
         .args(opt)
         .args(["-fwrapv", "-w", "-o"])
         .arg(&exe)
@@ -284,8 +291,8 @@ fn build(args: &[String]) -> Result<PathBuf, i32> {
             Err(1)
         }
         Err(e) => {
-            eprintln!("ioc: cannot run the C compiler `{}`: {}", cc, e);
-            eprintln!("     Install gcc or clang, or set IOC_CC to your compiler.");
+            eprintln!("ioc: cannot run the compiler `{}`: {}", cc.cmd, e);
+            eprintln!("     Run `ioc install --toolchain`, or set IOC_CC to your compiler.");
             Err(2)
         }
     }

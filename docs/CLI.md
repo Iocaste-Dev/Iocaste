@@ -1,4 +1,4 @@
-# The `ioc` command line (v0.0.8-alpha)
+# The `ioc` command line (v0.0.9-alpha)
 
 | Command | What it does |
 |---|---|
@@ -8,7 +8,7 @@
 | `ioc build [files] [--emit-c] [--debug]` | Compile to a native program in `./build` |
 | `ioc run [files] [-- args]` | Build and run |
 | `ioc clean [--locks]` | Delete `./build` (and `ioc.lock` with `--locks`) |
-| `ioc install [--toolchain] [--yes]` | Check the C compiler; install clusters from `ioc.toml`; write `ioc.lock` |
+| `ioc install [--toolchain] [--yes]` | Get a compiler if there is none (ioc downloads its own, no admin rights); install clusters from `ioc.toml`; write `ioc.lock` |
 | `ioc add <name> [version]` / `ioc add [name] --path <folder>` | Add a cluster |
 | `ioc remove <name>` | Remove a cluster |
 | `ioc list` | Clusters of this project and their status |
@@ -44,4 +44,6 @@ Line 1: newest version (`0.0.7-alpha`). Line 2 (optional): download link or note
 |---|---|
 | `IOC_HOME` | Where ioc keeps its config (default `~/.ioc`) |
 | `IOC_CC` | C compiler to use (overrides the `cc` setting) |
+| `IOC_TOOLCHAIN_URL` | Where to download the built-in compiler from (mirror, offline archive, `file://`) |
+| `IOC_NO_DOWNLOAD` | Never download a compiler; fail with a message instead |
 | `IOC_UPDATE_URL` | Update channel (overrides `update_url`) |

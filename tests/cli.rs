@@ -145,3 +145,49 @@ fn init_and_doctor() {
     let o = ioc(&dir, &d, &["doctor"]);
     assert!(text(&o).contains("ioc.toml"));
 }
+
+#[cfg(unix)]
+#[test]
+fn build_fetches_its_own_compiler_when_the_system_has_none() {
+    use std::os::unix::fs::PermissionsExt;
+    if !have_cc() { return; }
+    let d = sandbox("provision");
+    let home = d.join("home");
+    // a stand-in "zig" archive that forwards to the real compiler
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let os = if os == "macos" { "macos" } else { "linux" };
+    let pkg = d.join("pkg").join(format!("zig-{}-{}-0.13.0", os, arch));
+    std::fs::create_dir_all(&pkg).unwrap();
+    let zig = pkg.join("zig");
+    std::fs::write(&zig, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.13.0; exit 0; fi\nshift\nexec cc \"$@\"\n").unwrap();
+    std::fs::set_permissions(&zig, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tar = d.join("zig.tar.xz");
+    let st = Command::new("tar").arg("-cJf").arg(&tar).arg("-C").arg(d.join("pkg")).arg(pkg.file_name().unwrap()).status().unwrap();
+    assert!(st.success());
+    std::fs::write(d.join("a.ioc"), "namespace T;\nimport Ioc.Console;\npublic class P { public static main(): void { Console.println(\"hi\"); } }").unwrap();
+    // PATH holds only the tools ioc needs, so no system compiler is visible
+    let bin = d.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for t in ["curl", "tar", "xz", "sh", "cc", "env", "id"] {
+        if let Ok(o) = Command::new("which").arg(t).output() {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() && t != "cc" {
+                let _ = std::os::unix::fs::symlink(p, bin.join(t));
+            }
+        }
+    }
+    let o = Command::new(env!("CARGO_BIN_EXE_ioc"))
+        .args(["run", "a.ioc"])
+        .current_dir(&d)
+        .env("IOC_HOME", &home)
+        .env("PATH", &bin)
+        .env("IOC_TOOLCHAIN_URL", format!("file://{}", tar.display()))
+        .env_remove("IOC_CC")
+        .output()
+        .unwrap();
+    let t = text(&o);
+    assert!(t.contains("Setting up the built-in toolchain"), "{}", t);
+    // `cc` was removed from PATH, but the stand-in zig resolves it through PATH too, so only check the install step
+    assert!(home.join("toolchain").join(pkg.file_name().unwrap()).join("zig").exists(), "{}", t);
+    let _ = std::fs::remove_dir_all(&d);
+}

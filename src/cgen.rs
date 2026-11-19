@@ -124,6 +124,9 @@ struct Method<'a> {
     params: Vec<(String, CT)>,
     ret: CT,
     is_static: bool,
+    /// virtual, override, abstract, or declared in an interface: calls go through a dispatcher
+    is_virtual: bool,
+    is_abstract: bool,
     body: &'a Body,
     span: Span,
     file: usize,
@@ -154,6 +157,10 @@ struct Class<'a> {
     fields: Vec<FieldI<'a>>,
     ctors: Vec<CtorI<'a>>,
     dtor: Option<&'a DtorDecl>,
+    base: Option<usize>,
+    ifaces: Vec<usize>,
+    is_interface: bool,
+    is_abstract: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -210,6 +217,7 @@ struct Gen<'a> {
     expect: Option<CT>,
     methods: Vec<Method<'a>>,
     classes: Vec<Class<'a>>,
+    slots: Vec<usize>,
     errors: Vec<CError>,
     file: usize,
     /// the class whose code is being generated
@@ -401,6 +409,7 @@ pub fn generate(files: &[&SourceFile], types: &TypeTable) -> Result<String, Vec<
         expect: None,
         methods: Vec::new(),
         classes: Vec::new(),
+        slots: Vec::new(),
         errors: Vec::new(),
         file: 0,
         class: None,
@@ -469,25 +478,43 @@ pub fn generate(files: &[&SourceFile], types: &TypeTable) -> Result<String, Vec<
         g.out.push_str(&format!("typedef struct ioc_c{0} ioc_c{0};\n", i));
     }
     g.emit_enums();
-    for i in 0..g.classes.len() {
-        g.emit_struct(i);
-    }
+    g.emit_structs();
     for i in 0..g.classes.len() {
         g.out.push_str(&format!("static void ioc_drop_{0}(ioc_c{0} *v_this);\n", i));
+        if g.classes[i].is_interface {
+            continue;
+        }
+        g.out.push_str(&format!("static void ioc_dtor_{0}(ioc_c{0} *v_this);\n", i));
         for k in 0..g.classes[i].ctors.len() {
-            let sig = g.ctor_signature(i, k);
-            g.out.push_str(&format!("static {};\n", sig));
+            let isig = g.init_signature(i, k);
+            g.out.push_str(&format!("static {};\n", isig));
+            if g.concrete(i) {
+                let sig = g.ctor_signature(i, k);
+                g.out.push_str(&format!("static {};\n", sig));
+            }
         }
         if g.classes[i].ctors.is_empty() {
-            g.out.push_str(&format!("static ioc_c{0} *ioc_new_{0}_default(void);\n", i));
+            g.out.push_str(&format!("static void ioc_init_{0}_default(ioc_c{0} *v_this);\n", i));
+            if g.concrete(i) {
+                g.out.push_str(&format!("static ioc_c{0} *ioc_new_{0}_default(void);\n", i));
+            }
         }
     }
+    for i in 0..g.slots.len() {
+        let p = g.dispatcher_proto(g.slots[i]);
+        g.out.push_str(&format!("{};\n", p));
+    }
     for i in 0..g.methods.len() {
+        if g.methods[i].is_abstract {
+            continue;
+        }
         let sig = g.signature(i);
         g.out.push_str(&format!("static {};\n", sig));
     }
     g.out.push('\n');
     g.out.push_str(&defs);
+    let disp = g.emit_dispatchers();
+    g.out.push_str(&disp);
     let e = &g.methods[entry];
     let call_args = if e.params.is_empty() { "" } else { "args" };
     let call = format!("{}({})", e.c_name, call_args);
@@ -507,7 +534,7 @@ impl<'a> Gen<'a> {
     fn unsupported(&mut self, span: Span, what: &str) {
         self.errors.push(CError {
             file: self.file,
-            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.8)", what), span)
+            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.9)", what), span)
                 .with_hint("`ioc check` still validates it; code generation for it arrives in the next versions"),
         });
     }
@@ -555,8 +582,19 @@ impl<'a> Gen<'a> {
     }
 
     fn register_type(&mut self, t: &'a TypeDecl) {
-        if t.kind == TypeKind::Class && t.generics.is_empty() {
-            self.classes.push(Class { name: t.name.clone(), file: self.file, span: t.span, fields: Vec::new(), ctors: Vec::new(), dtor: None });
+        if matches!(t.kind, TypeKind::Class | TypeKind::Interface) && t.generics.is_empty() {
+            self.classes.push(Class {
+                name: t.name.clone(),
+                file: self.file,
+                span: t.span,
+                fields: Vec::new(),
+                ctors: Vec::new(),
+                dtor: None,
+                base: None,
+                ifaces: Vec::new(),
+                is_interface: t.kind == TypeKind::Interface,
+                is_abstract: t.modifiers.contains(Modifier::Abstract),
+            });
         }
     }
 
@@ -572,30 +610,34 @@ impl<'a> Gen<'a> {
     }
 
     fn collect_type(&mut self, t: &'a TypeDecl, next_class: &mut usize) {
-        if t.kind != TypeKind::Class {
-            self.unsupported(
-                t.span,
-                &format!(
-                    "`{}`",
-                    match t.kind {
-                        TypeKind::Struct => "struct",
-                        TypeKind::Record => "record",
-                        _ => "interface",
-                    }
-                ),
-            );
+        if !matches!(t.kind, TypeKind::Class | TypeKind::Interface) {
+            self.unsupported(t.span, if t.kind == TypeKind::Struct { "`struct`" } else { "`record`" });
             return;
         }
         if !t.generics.is_empty() {
             self.unsupported(t.span, "a generic class");
             return;
         }
-        if !t.bases.is_empty() {
-            self.unsupported(t.span, "inheritance and interfaces");
-        }
         let ci = *next_class;
         *next_class += 1;
+        for b in &t.bases {
+            match self.type_ct(b) {
+                Some(CT::Obj(bi)) => {
+                    if self.classes[bi].is_interface {
+                        self.classes[ci].ifaces.push(bi);
+                    } else if self.classes[ci].base.is_none() && !self.classes[ci].is_interface {
+                        self.classes[ci].base = Some(bi);
+                    }
+                }
+                _ => self.unsupported(b.span, "this base type"),
+            }
+        }
+        let is_iface = t.kind == TypeKind::Interface;
         for m in &t.members {
+            if is_iface && !matches!(m, Member::Method(_)) {
+                self.unsupported(member_span(m), "this kind of interface member");
+                continue;
+            }
             match m {
                 Member::Method(md) => self.collect_method(ci, &t.name, md),
                 Member::Field(f) => {
@@ -674,6 +716,8 @@ impl<'a> Gen<'a> {
             params: Vec::new(),
             ret: ct,
             is_static: false,
+            is_virtual: false,
+            is_abstract: false,
             body: &get.body,
             span: p.span,
             file: self.file,
@@ -688,10 +732,6 @@ impl<'a> Gen<'a> {
         }
         if md.modifiers.contains(Modifier::Async) {
             self.unsupported(md.span, "`async`");
-            return;
-        }
-        if md.modifiers.contains(Modifier::Virtual) || md.modifiers.contains(Modifier::Override) || md.modifiers.contains(Modifier::Abstract) {
-            self.unsupported(md.span, "`virtual` / `override` / `abstract`");
             return;
         }
         let mut params = Vec::new();
@@ -726,6 +766,11 @@ impl<'a> Gen<'a> {
             params,
             ret,
             is_static: md.modifiers.contains(Modifier::Static),
+            is_virtual: self.classes[ci].is_interface
+                || md.modifiers.contains(Modifier::Virtual)
+                || md.modifiers.contains(Modifier::Override)
+                || md.modifiers.contains(Modifier::Abstract),
+            is_abstract: self.classes[ci].is_interface || md.modifiers.contains(Modifier::Abstract),
             body: &md.body,
             span: md.span,
             file: self.file,
@@ -771,21 +816,173 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_struct(&mut self, i: usize) {
-        let mut s = format!("struct ioc_c{} {{\n", i);
-        let c = &self.classes[i];
-        let mut any = false;
-        for f in &c.fields {
-            if f.getter.is_none() {
-                s.push_str(&format!("    {} f_{};\n", f.ct.c(), f.name));
-                any = true;
+    fn emit_structs(&mut self) {
+        let n = self.classes.len();
+        let mut done = vec![false; n];
+        fn visit(g: &mut Gen, i: usize, done: &mut Vec<bool>) {
+            if done[i] {
+                return;
+            }
+            done[i] = true;
+            if let Some(b) = g.classes[i].base {
+                visit(g, b, done);
+            }
+            let mut s = format!("struct ioc_c{} {{\n", i);
+            let c = &g.classes[i];
+            match c.base {
+                Some(b) => s.push_str(&format!("    ioc_c{} b_;\n", b)),
+                None => s.push_str("    int ioc_cls;\n"),
+            }
+            for f in &c.fields {
+                if f.getter.is_none() {
+                    s.push_str(&format!("    {} f_{};\n", f.ct.c(), f.name));
+                }
+            }
+            s.push_str("};\n");
+            g.out.push_str(&s);
+        }
+        for i in 0..n {
+            visit(self, i, &mut done);
+        }
+    }
+
+    // ---- class hierarchy helpers
+
+    /// The class, its base classes (or, for an interface, the interfaces it extends).
+    fn chain(&self, ci: usize) -> Vec<usize> {
+        let mut out = vec![ci];
+        if self.classes[ci].is_interface {
+            let mut i = 0;
+            while i < out.len() {
+                for &b in &self.classes[out[i]].ifaces.clone() {
+                    if !out.contains(&b) {
+                        out.push(b);
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            let mut c = ci;
+            while let Some(b) = self.classes[c].base {
+                out.push(b);
+                c = b;
             }
         }
-        if !any {
-            s.push_str("    char pad_;\n");
+        out
+    }
+
+    /// Is `a` the same as `b`, derived from it, or an implementation of it?
+    fn is_sub(&self, a: usize, b: usize) -> bool {
+        if a == b {
+            return true;
         }
-        s.push_str("};\n");
-        self.out.push_str(&s);
+        let mut seen = vec![a];
+        let mut i = 0;
+        while i < seen.len() {
+            let c = seen[i];
+            i += 1;
+            let mut next: Vec<usize> = self.classes[c].ifaces.clone();
+            if let Some(bs) = self.classes[c].base {
+                next.push(bs);
+            }
+            for n in next {
+                if n == b {
+                    return true;
+                }
+                if !seen.contains(&n) {
+                    seen.push(n);
+                }
+            }
+        }
+        false
+    }
+
+    fn concrete(&self, ci: usize) -> bool {
+        !self.classes[ci].is_interface && !self.classes[ci].is_abstract
+    }
+
+    /// Where field `name` lives: (class that declares it, index in that class).
+    fn find_field(&self, ci: usize, name: &str) -> Option<(usize, usize)> {
+        for c in self.chain(ci) {
+            if let Some(i) = self.classes[c].fields.iter().position(|f| f.name == name) {
+                return Some((c, i));
+            }
+        }
+        None
+    }
+
+    /// `obj` (a pointer to class `from`) seen as a pointer to its ancestor `to`.
+    fn upcast(&self, obj: &str, from: usize, to: usize) -> String {
+        if from == to {
+            obj.to_string()
+        } else {
+            format!("((ioc_c{}*)({}))", to, obj)
+        }
+    }
+
+    /// Slot dispatcher for virtual method `m`: calls the implementation matching the object's real class.
+    fn slot_call(&mut self, m: usize, recv: String, args: Vec<String>) -> String {
+        if !self.slots.contains(&m) {
+            self.slots.push(m);
+        }
+        let mut all = vec![recv];
+        all.extend(args);
+        format!("ioc_vcall_{}({})", m, all.join(", "))
+    }
+
+    /// The method that class `c` runs for the virtual method `m0`.
+    fn impl_for(&self, c: usize, m0: usize) -> Option<usize> {
+        let (name, params) = (&self.methods[m0].name, &self.methods[m0].params);
+        for x in self.chain(c) {
+            for (i, m) in self.methods.iter().enumerate() {
+                if m.class_idx == x && m.name == *name && m.params == *params && !m.is_static && !m.is_abstract {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    fn dispatcher_proto(&self, m: usize) -> String {
+        let me = &self.methods[m];
+        let mut params = vec![format!("ioc_c{}* o", me.class_idx)];
+        params.extend(me.params.iter().enumerate().map(|(i, (_, t))| format!("{} a{}", t.c(), i)));
+        format!("static {} ioc_vcall_{}({})", me.ret.c(), m, params.join(", "))
+    }
+
+    fn emit_dispatchers(&mut self) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < self.slots.len() {
+            let m = self.slots[i];
+            i += 1;
+            let proto = self.dispatcher_proto(m);
+            let me_class = self.methods[m].class_idx;
+            let ret = self.methods[m].ret;
+            let n_params = self.methods[m].params.len();
+            out.push_str(&format!("{} {{\n    switch (IOC_CLS(o)) {{\n", proto));
+            for c in 0..self.classes.len() {
+                if !self.concrete(c) || !self.is_sub(c, me_class) {
+                    continue;
+                }
+                let Some(k) = self.impl_for(c, m) else { continue };
+                let impl_class = self.methods[k].class_idx;
+                let mut args = vec![format!("(ioc_c{}*)o", impl_class)];
+                args.extend((0..n_params).map(|j| format!("a{}", j)));
+                let call = format!("{}({})", self.methods[k].c_name, args.join(", "));
+                if ret == CT::Void {
+                    out.push_str(&format!("        case {}: {}; return;\n", c, call));
+                } else {
+                    out.push_str(&format!("        case {}: return {};\n", c, call));
+                }
+            }
+            out.push_str("        default: ioc_panic(\"bad virtual call\");\n    }\n");
+            if ret != CT::Void {
+                out.push_str(&format!("    return ({}){{0}};\n", ret.c()));
+            }
+            out.push_str("}\n\n");
+        }
+        out
     }
 
     fn signature(&self, i: usize) -> String {
@@ -799,11 +996,23 @@ impl<'a> Gen<'a> {
         format!("{} {}({})", m.ret.c(), m.c_name, ps)
     }
 
-    fn ctor_signature(&self, ci: usize, k: usize) -> String {
+    fn ctor_params(&self, ci: usize, k: usize) -> String {
         let c = &self.classes[ci].ctors[k];
         let params: Vec<String> = c.params.iter().map(|(n, t)| format!("{} v_{}", t.c(), n)).collect();
-        let ps = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-        format!("ioc_c{}* {}({})", ci, c.c_name, ps)
+        if params.is_empty() { "void".to_string() } else { params.join(", ") }
+    }
+
+    /// `static void ioc_init_C_k(ioc_cC* v_this, ...)`: runs base init, field initializers and the body.
+    fn init_signature(&self, ci: usize, k: usize) -> String {
+        let c = &self.classes[ci].ctors[k];
+        let mut params = vec![format!("ioc_c{}* v_this", ci)];
+        params.extend(c.params.iter().map(|(n, t)| format!("{} v_{}", t.c(), n)));
+        format!("void {}({})", c.c_name.replace("ioc_new_", "ioc_init_"), params.join(", "))
+    }
+
+    /// `ioc_cC* ioc_new_C_k(...)`: allocates and initializes.
+    fn ctor_signature(&self, ci: usize, k: usize) -> String {
+        format!("ioc_c{}* {}({})", ci, self.classes[ci].ctors[k].c_name, self.ctor_params(ci, k))
     }
 
     fn line(&mut self, s: &str) {
@@ -854,7 +1063,6 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_return(&mut self, val: Option<(String, CT)>) {
-        let ctor = self.ctx == Ctx::Ctor;
         match val {
             Some((c, t)) if t != CT::Void => {
                 self.line("{");
@@ -872,7 +1080,7 @@ impl<'a> Gen<'a> {
                     self.line("goto ioc_dtor_end;");
                 } else {
                     self.drop_lines(0);
-                    self.line(if ctor { "return v_this;" } else { "return;" });
+                    self.line("return;");
                 }
                 self.ind -= 1;
                 self.line("}");
@@ -885,55 +1093,89 @@ impl<'a> Gen<'a> {
     fn emit_class(&mut self, ci: usize) {
         self.file = self.classes[ci].file;
         self.class = Some(ci);
-        // destructor + drop
-        self.ctx = Ctx::Dtor;
         self.in_static = false;
         self.ret = CT::Void;
         self.scopes = vec![Scope::default()];
-        self.line(&format!("static void ioc_drop_{0}(ioc_c{0} *v_this) {{", ci));
-        self.ind += 1;
-        self.line("if (!v_this) return;");
-        if let Some(d) = self.classes[ci].dtor {
-            self.line("{");
-            self.ind += 1;
-            self.push_scope();
-            for s in &d.body.stmts {
-                self.stmt(s);
-            }
-            self.pop_scope();
-            self.ind -= 1;
-            self.line("}");
-            self.line("ioc_dtor_end:; (void)0;");
-        }
-        let owned: Vec<(String, usize)> = self.classes[ci]
-            .fields
-            .iter()
-            .filter(|f| f.getter.is_none())
-            .filter_map(|f| if let CT::Obj(j) = f.ct { Some((f.name.clone(), j)) } else { None })
-            .collect();
-        for (n, j) in owned {
-            self.line(&format!("ioc_drop_{}(v_this->f_{});", j, n));
-        }
-        self.line("free(v_this);");
-        self.ind -= 1;
-        self.line("}");
-        self.out.push('\n');
 
-        // constructors
-        self.ctx = Ctx::Ctor;
-        if self.classes[ci].ctors.is_empty() {
-            self.scopes = vec![Scope::default()];
-            self.line(&format!("static ioc_c{0} *ioc_new_{0}_default(void) {{", ci));
+        // ---- destructor chain (runs the destructor body, frees owned fields, then the base part)
+        if !self.classes[ci].is_interface {
+            self.ctx = Ctx::Dtor;
+            self.line(&format!("static void ioc_dtor_{0}(ioc_c{0} *v_this) {{", ci));
             self.ind += 1;
-            self.line(&format!("ioc_c{0} *v_this = (ioc_c{0} *)ioc_zalloc(sizeof(ioc_c{0}));", ci));
-            self.emit_field_inits(ci);
-            self.line("return v_this;");
+            if let Some(d) = self.classes[ci].dtor {
+                self.line("{");
+                self.ind += 1;
+                self.push_scope();
+                for s in &d.body.stmts {
+                    self.stmt(s);
+                }
+                self.pop_scope();
+                self.ind -= 1;
+                self.line("}");
+                self.line("ioc_dtor_end:; (void)0;");
+            }
+            let owned: Vec<(String, usize)> = self.classes[ci]
+                .fields
+                .iter()
+                .filter(|f| f.getter.is_none())
+                .filter_map(|f| if let CT::Obj(j) = f.ct { Some((f.name.clone(), j)) } else { None })
+                .collect();
+            for (n, j) in owned {
+                self.line(&format!("ioc_drop_{}(v_this->f_{});", j, n));
+            }
+            if let Some(b) = self.classes[ci].base {
+                self.line(&format!("ioc_dtor_{0}((ioc_c{0} *)v_this);", b));
+            }
             self.ind -= 1;
             self.line("}");
             self.out.push('\n');
         }
+        // ---- drop: finds the real class, runs its destructor chain, frees the memory once
+        self.line(&format!("static void ioc_drop_{0}(ioc_c{0} *v_this) {{", ci));
+        self.ind += 1;
+        self.line("if (!v_this) return;");
+        self.line("switch (IOC_CLS(v_this)) {");
+        for c in 0..self.classes.len() {
+            if self.concrete(c) && self.is_sub(c, ci) {
+                self.line(&format!("    case {0}: ioc_dtor_{0}((ioc_c{0} *)v_this); break;", c));
+            }
+        }
+        self.line("    default: break;");
+        self.line("}");
+        self.line("free(v_this);");
+        self.ind -= 1;
+        self.line("}");
+        self.out.push('\n');
+        if self.classes[ci].is_interface {
+            self.class = None;
+            return;
+        }
+
+        // ---- constructors
+        self.ctx = Ctx::Ctor;
+        if self.classes[ci].ctors.is_empty() {
+            self.scopes = vec![Scope::default()];
+            self.line(&format!("static void ioc_init_{0}_default(ioc_c{0} *v_this) {{", ci));
+            self.ind += 1;
+            self.emit_base_init(ci, None);
+            self.emit_field_inits(ci);
+            self.ind -= 1;
+            self.line("}");
+            self.out.push('\n');
+            if self.concrete(ci) {
+                self.line(&format!("static ioc_c{0} *ioc_new_{0}_default(void) {{", ci));
+                self.ind += 1;
+                self.line(&format!("ioc_c{0} *v_this = (ioc_c{0} *)ioc_zalloc(sizeof(ioc_c{0}));", ci));
+                self.line(&format!("IOC_CLS(v_this) = {};", ci));
+                self.line(&format!("ioc_init_{}_default(v_this);", ci));
+                self.line("return v_this;");
+                self.ind -= 1;
+                self.line("}");
+                self.out.push('\n');
+            }
+        }
         for k in 0..self.classes[ci].ctors.len() {
-            let sig = self.ctor_signature(ci, k);
+            let sig = self.init_signature(ci, k);
             let (decl, params): (&'a CtorDecl, Vec<(String, CT)>) = {
                 let c = &self.classes[ci].ctors[k];
                 (c.decl, c.params.clone())
@@ -944,21 +1186,75 @@ impl<'a> Gen<'a> {
             }
             self.line(&format!("static {} {{", sig));
             self.ind += 1;
-            self.line(&format!("ioc_c{0} *v_this = (ioc_c{0} *)ioc_zalloc(sizeof(ioc_c{0}));", ci));
+            // `base(args)` must come first
+            let (base_call, rest): (Option<&'a [Expr]>, &'a [Stmt]) = match decl.body.stmts.first().map(|s| &s.kind) {
+                Some(StmtKind::Expr(Expr { kind: ExprKind::Call { callee, args }, .. })) if matches!(callee.kind, ExprKind::Base) => {
+                    (Some(args.as_slice()), &decl.body.stmts[1..])
+                }
+                _ => (None, &decl.body.stmts[..]),
+            };
+            self.emit_base_init(ci, base_call);
             self.emit_field_inits(ci);
             self.push_scope();
-            for s in &decl.body.stmts {
+            for s in rest {
                 self.stmt(s);
             }
             self.pop_scope();
             self.drop_lines(0);
-            self.line("return v_this;");
             self.ind -= 1;
             self.line("}");
             self.out.push('\n');
+            if self.concrete(ci) {
+                let new_sig = self.ctor_signature(ci, k);
+                let names: Vec<String> = params.iter().map(|(n, _)| format!("v_{}", n)).collect();
+                let init_name = self.classes[ci].ctors[k].c_name.replace("ioc_new_", "ioc_init_");
+                self.line(&format!("static {} {{", new_sig));
+                self.ind += 1;
+                self.line(&format!("ioc_c{0} *v_this = (ioc_c{0} *)ioc_zalloc(sizeof(ioc_c{0}));", ci));
+                self.line(&format!("IOC_CLS(v_this) = {};", ci));
+                let mut a = vec!["v_this".to_string()];
+                a.extend(names);
+                self.line(&format!("{}({});", init_name, a.join(", ")));
+                self.line("return v_this;");
+                self.ind -= 1;
+                self.line("}");
+                self.out.push('\n');
+            }
         }
         self.ctx = Ctx::Method;
         self.class = None;
+    }
+
+    /// Run the base class initializer: the explicit `base(args)`, or its constructor without arguments.
+    fn emit_base_init(&mut self, ci: usize, explicit: Option<&'a [Expr]>) {
+        let Some(b) = self.classes[ci].base else { return };
+        let args = explicit.unwrap_or(&[]);
+        let Some(av) = self.eval_args(args) else { return };
+        if self.classes[b].ctors.is_empty() {
+            if !av.is_empty() {
+                self.err(self.classes[ci].span, "the base class has no constructor that takes arguments");
+                return;
+            }
+            self.line(&format!("ioc_init_{0}_default((ioc_c{0} *)v_this);", b));
+            return;
+        }
+        let cands: Vec<(usize, Vec<CT>)> =
+            self.classes[b].ctors.iter().enumerate().map(|(k, c)| (k, c.params.iter().map(|p| p.1).collect())).collect();
+        let Some(k) = self.pick(&cands, &av) else {
+            let span = self.classes[ci].span;
+            self.err(span, "the backend found no base constructor taking these arguments");
+            return;
+        };
+        let params = self.classes[b].ctors[k].params.clone();
+        let init = self.classes[b].ctors[k].c_name.replace("ioc_new_", "ioc_init_");
+        let mut list = vec![format!("(ioc_c{}*)v_this", b)];
+        for (a, (_, pt)) in av.iter().zip(params.iter()) {
+            match self.arg_for(a, *pt) {
+                Some(c) => list.push(c),
+                None => return,
+            }
+        }
+        self.line(&format!("{}({});", init, list.join(", ")));
     }
 
     fn emit_field_inits(&mut self, ci: usize) {
@@ -973,6 +1269,9 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_method(&mut self, i: usize) {
+        if self.methods[i].is_abstract {
+            return;
+        }
         let (file, ci, ret, body, span, is_static) = {
             let m = &self.methods[i];
             (m.file, m.class_idx, m.ret, m.body, m.span, m.is_static)
@@ -1198,12 +1497,12 @@ impl<'a> Gen<'a> {
     fn arg_for(&mut self, a: &Arg, param: CT) -> Option<String> {
         if matches!(param, CT::Obj(_)) {
             return match a.kind {
-                ArgKind::Local => Some(format!("IOC_TAKE({})", a.code)),
+                ArgKind::Local => Some(self.coerce(format!("IOC_TAKE({})", a.code), a.ct, param)),
                 ArgKind::Place => {
                     self.unsupported(a.span, "moving an object out of a field (borrow it with `ref` instead)");
                     None
                 }
-                ArgKind::Plain => Some(a.code.clone()),
+                ArgKind::Plain => Some(self.coerce(a.code.clone(), a.ct, param)),
             };
         }
         Some(self.coerce(a.code.clone(), a.ct, param))
@@ -1230,14 +1529,18 @@ impl<'a> Gen<'a> {
 
     /// Field (or property) `name` of class `ci`, read through `obj`.
     fn field_of(&mut self, obj: String, ci: usize, name: &str, span: Span) -> Option<(String, CT)> {
-        let Some(f) = self.classes[ci].fields.iter().find(|f| f.name == name) else {
+        let Some((owner, fi)) = self.find_field(ci, name) else {
             self.unsupported(span, &format!("the member `{}`", name));
             return None;
         };
-        let ct = f.ct;
-        match f.getter {
-            Some(k) => Some((format!("{}({})", self.methods[k].c_name, obj), ct)),
-            None => Some((format!("(({})->f_{})", obj, name), ct)),
+        let (ct, getter) = {
+            let f = &self.classes[owner].fields[fi];
+            (f.ct, f.getter)
+        };
+        let o = self.upcast(&obj, ci, owner);
+        match getter {
+            Some(k) => Some((format!("{}({})", self.methods[k].c_name, o), ct)),
+            None => Some((format!("(({})->f_{})", o, name), ct)),
         }
     }
 
@@ -1297,7 +1600,7 @@ impl<'a> Gen<'a> {
                 }
                 // a field of `this`
                 if let (Some(ci), false) = (self.class, self.in_static) {
-                    if self.classes[ci].fields.iter().any(|f| f.name == *name) {
+                    if self.find_field(ci, name).is_some() {
                         return self.field_of("v_this".into(), ci, name, e.span);
                     }
                 }
@@ -1530,6 +1833,8 @@ impl<'a> Gen<'a> {
                     score += 3;
                 } else if matches!((pt, at), (CT::Ref(x), CT::Obj(y)) | (CT::Ref(x), CT::Ref(y)) if *x == y) {
                     score += 2;
+                } else if matches!((pt, at), (CT::Ref(x) | CT::Obj(x), CT::Obj(y) | CT::Ref(y)) if self.is_sub(y, *x)) {
+                    score += 1;
                 } else if pt.is_num() && at.is_num() && (pt.is_float() || !at.is_float()) {
                     score += 1;
                 } else if self.can_store(*pt, at) {
@@ -1580,6 +1885,9 @@ impl<'a> Gen<'a> {
                         };
                     }
                 }
+                if let ExprKind::Base = target.kind {
+                    return self.base_method_call(name, av, span);
+                }
                 let (tc, tt) = self.expr(target)?;
                 match tt {
                     CT::Obj(ci) | CT::Ref(ci) => self.user_call(ci, name, av, Some(tc), span),
@@ -1593,44 +1901,109 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `base.name(args)`: the base class's own implementation, called directly (not through dispatch).
+    fn base_method_call(&mut self, name: &str, av: Vec<Arg>, span: Span) -> Option<(String, CT)> {
+        let (Some(ci), false) = (self.class, self.in_static) else {
+            self.err(span, "`base` can only be used inside an instance method");
+            return None;
+        };
+        let Some(b) = self.classes[ci].base else {
+            self.err(span, "this class has no base class");
+            return None;
+        };
+        let mut cands: Vec<(usize, Vec<CT>)> = Vec::new();
+        for c in self.chain(b) {
+            for (i, m) in self.methods.iter().enumerate() {
+                if m.class_idx == c && m.name == name && !m.is_abstract {
+                    let sig: Vec<CT> = m.params.iter().map(|p| p.1).collect();
+                    if !cands.iter().any(|(_, s)| *s == sig) {
+                        cands.push((i, sig));
+                    }
+                }
+            }
+        }
+        let Some(i) = self.pick(&cands, &av) else {
+            self.err(span, format!("the base class has no method `{}` taking these arguments", name));
+            return None;
+        };
+        let (c_name, ret, params, mclass) = {
+            let m = &self.methods[i];
+            (m.c_name.clone(), m.ret, m.params.clone(), m.class_idx)
+        };
+        let mut list = vec![format!("((ioc_c{}*)v_this)", mclass)];
+        for (a, (_, pt)) in av.iter().zip(params.iter()) {
+            list.push(self.arg_for(a, *pt)?);
+        }
+        Some((format!("{}({})", c_name, list.join(", ")), ret))
+    }
+
     fn is_this_field(&self, name: &str) -> bool {
         match (self.class, self.in_static) {
-            (Some(ci), false) => self.classes[ci].fields.iter().any(|f| f.name == name),
+            (Some(ci), false) => self.find_field(ci, name).is_some(),
             _ => false,
         }
     }
 
     fn user_call(&mut self, ci: usize, name: &str, av: Vec<Arg>, recv: Option<String>, span: Span) -> Option<(String, CT)> {
-        let cands: Vec<(usize, Vec<CT>)> = self
-            .methods
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.class_idx == ci && m.name == name)
-            .map(|(i, m)| (i, m.params.iter().map(|p| p.1).collect()))
-            .collect();
+        // methods visible on `ci`: its own first, then inherited ones; an override hides the method it replaces
+        let mut cands: Vec<(usize, Vec<CT>)> = Vec::new();
+        for c in self.chain(ci) {
+            for (i, m) in self.methods.iter().enumerate() {
+                if m.class_idx == c && m.name == name {
+                    let sig: Vec<CT> = m.params.iter().map(|p| p.1).collect();
+                    if !cands.iter().any(|(_, s)| *s == sig) {
+                        cands.push((i, sig));
+                    }
+                }
+            }
+        }
         let Some(i) = self.pick(&cands, &av) else {
             let cn = self.classes[ci].name.clone();
             self.err(span, format!("the backend found no method `{}.{}` taking these arguments", cn, name));
             return None;
         };
-        let (c_name, ret, is_static, params) = {
+        let (c_name, ret, is_static, params, mclass, virt) = {
             let m = &self.methods[i];
-            (m.c_name.clone(), m.ret, m.is_static, m.params.clone())
+            (m.c_name.clone(), m.ret, m.is_static, m.params.clone(), m.class_idx, m.is_virtual)
         };
         let mut list: Vec<String> = Vec::new();
+        let mut root = i;
+        let mut recv_code = String::new();
+        let mut recv_class = ci;
         if !is_static {
             match recv {
-                Some(r) => list.push(r),
-                None if !self.in_static && self.class == Some(ci) => list.push("v_this".into()),
+                Some(r) => recv_code = r,
+                None if !self.in_static && self.class.is_some() => {
+                    recv_code = "v_this".into();
+                    recv_class = self.class.unwrap();
+                }
                 None => {
                     self.err(span, format!("`{}` is an instance method and needs an object", name));
                     return None;
                 }
             }
+            if virt {
+                // the base-most declaration owns the dispatcher
+                let (n, p) = (self.methods[i].name.clone(), self.methods[i].params.clone());
+                for c in self.chain(recv_class).into_iter().rev() {
+                    if let Some(k) = self.methods.iter().position(|m| m.class_idx == c && m.name == n && m.params == p && m.is_virtual) {
+                        root = k;
+                        break;
+                    }
+                }
+            }
+            let target = if virt { self.methods[root].class_idx } else { mclass };
+            list.push(self.upcast(&recv_code, recv_class, target));
         }
+        let mut args = Vec::new();
         for (a, (_, pt)) in av.iter().zip(params.iter()) {
-            list.push(self.arg_for(a, *pt)?);
+            args.push(self.arg_for(a, *pt)?);
         }
+        if !is_static && virt {
+            let call = self.slot_call(root, list.remove(0), args);
+            return Some((call, ret));
+        }
+        list.extend(args);
         Some((format!("{}({})", c_name, list.join(", ")), ret))
     }
 
@@ -1640,6 +2013,10 @@ impl<'a> Gen<'a> {
             self.unsupported(span, "`new` of this type");
             return None;
         };
+        if !self.concrete(ci) {
+            self.err(span, "cannot create an object of an abstract class or an interface");
+            return None;
+        }
         if self.classes[ci].ctors.is_empty() {
             if !av.is_empty() {
                 self.err(span, "this class has no constructor that takes arguments");
@@ -1755,6 +2132,9 @@ impl<'a> Gen<'a> {
     fn coerce(&self, code: String, from: CT, to: CT) -> String {
         if from == to {
             return code;
+        }
+        if let (CT::Obj(x) | CT::Ref(x), CT::Obj(y) | CT::Ref(y)) = (to, from) {
+            return if x == y { code } else { format!("((ioc_c{}*)({}))", x, code) };
         }
         if let CT::Enum(ei) = to {
             if let EKind::Option(inner) = self.enums[ei].kind {
@@ -2125,5 +2505,17 @@ fn wide(t: CT) -> &'static str {
         "uint64_t"
     } else {
         "int64_t"
+    }
+}
+
+fn member_span(m: &Member) -> Span {
+    match m {
+        Member::Method(x) => x.span,
+        Member::Field(x) => x.span,
+        Member::Property(x) => x.span,
+        Member::Constructor(x) => x.span,
+        Member::Destructor(x) => x.span,
+        Member::Type(x) => x.span,
+        Member::Enum(x) => x.span,
     }
 }

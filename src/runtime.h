@@ -147,6 +147,8 @@ static void *ioc_zalloc(size_t n) {
     if (!p) ioc_panic("out of memory");
     return p;
 }
+/* the first int of every object is its class id (used for virtual calls and drops) */
+#define IOC_CLS(o) (*(int *)(o))
 #define IOC_TAKE(p) ({ __typeof__(p) ioc_t_ = (p); (p) = NULL; ioc_t_; })
 
 /* ---- parsing and input (v0.0.8) */

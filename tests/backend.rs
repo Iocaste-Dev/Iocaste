@@ -133,7 +133,7 @@ fn args_are_available() {
 
 #[test]
 fn unsupported_features_get_a_clear_error() {
-    let e = compile("namespace T;\npublic interface I { f(): int; }\npublic class P { public static main(): int { return 0; } }").unwrap_err();
+    let e = compile("namespace T;\npublic class P { public static main(): int { var a = [1, 2]; return 0; } }").unwrap_err();
     assert!(e.contains("not supported by the C backend"), "{}", e);
 }
 
@@ -366,4 +366,90 @@ fn objects_inside_enums_are_refused_for_now() {
     let src = "namespace T;\npublic class A { }\npublic enum E { X(a: A) }\npublic class P { public static main(): int { return 0; } }";
     let e = compile(src).unwrap_err();
     assert!(e.contains("not supported by the C backend"), "{}", e);
+}
+
+// ---------------------------------------------------------------- v0.0.9: inheritance
+
+#[test]
+fn shapes_example_dispatches_virtually() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/shapes.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "rect area=6\nsquare! rect area=16\ncircle area=12\ntotal 18\n  circle freed\n");
+}
+
+fn top(types: &str, body: &str) -> String {
+    format!(
+        "namespace T;\nimport Ioc.Console;\n{}\n{}\npublic class P {{\n public static main(args: string[]): int {{ {} return 0; }}\n}}",
+        RES, types, body
+    )
+}
+
+const ANIMALS: &str = "public class Animal {
+    public id: int;
+    public constructor(id: int) { this.id = id; Console.println($\"animal {id}\"); }
+    public virtual speak(): string => \"...\";
+    destructor() { Console.println($\"free animal {id}\"); }
+}
+public class Dog : Animal {
+    public tag: Res;
+    public constructor(id: int) { base(id); this.tag = new Res(id + 100); Console.println(\"dog\"); }
+    public override speak(): string => \"woof\";
+    destructor() { Console.println($\"free dog {id}\"); }
+}
+public class Cat : Animal {
+    public constructor(id: int) { base(id); }
+}
+public class Holder {
+    public pet: Animal;
+    public constructor(pet: Animal) { this.pet = pet; }
+}
+";
+
+#[test]
+fn constructors_chain_base_first_and_destructors_run_derived_first() {
+    if !have_cc() { return; }
+    let (code, out, err) = run_asan(&top(ANIMALS, "var d = new Dog(1); Console.println(d.speak());"));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "animal 1\nmake 101\ndog\nwoof\nfree dog 1\nfree 101\nfree animal 1\n");
+}
+
+#[test]
+fn an_object_stored_as_its_base_class_is_freed_as_the_real_class() {
+    if !have_cc() { return; }
+    let body = "var h = new Holder(new Dog(2)); var c = new Cat(3); var h2 = new Holder(c); Console.println(h.pet.speak()); Console.println(h2.pet.speak());";
+    let (code, out, err) = run_asan(&top(ANIMALS, body));
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("woof\n...\n"), "{}", out);
+    assert_eq!(out.matches("free animal 2").count(), 1, "{}", out);
+    assert_eq!(out.matches("free dog 2").count(), 1, "{}", out);
+    assert_eq!(out.matches("free 102").count(), 1, "{}", out);
+    assert_eq!(out.matches("free animal 3").count(), 1, "{}", out);
+}
+
+#[test]
+fn interface_typed_borrows_call_the_real_implementation() {
+    if !have_cc() { return; }
+    let extra = "public interface Talk { say(): string; }
+public class A : Talk { public say(): string => \"a\"; }
+public class B : Talk { public say(): string => \"b\"; }
+public class Q { public static go(t: ref Talk): string => t.say(); }";
+    let (code, out, err) = run_asan(&top(extra, "var a = new A(); var b = new B(); Console.println(Q.go(ref a) + Q.go(ref b));"));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "ab\n");
+}
+
+#[test]
+fn inherited_fields_and_methods_are_reachable() {
+    if !have_cc() { return; }
+    let (code, out, _) = run(&top(ANIMALS, "var c = new Cat(7); Console.println($\"{c.id}\"); Console.println(c.speak());"));
+    assert_eq!(code, 0);
+    assert!(out.ends_with("7\n...\nfree animal 7\n"), "{}", out);
+}
+
+#[test]
+fn abstract_classes_and_interfaces_cannot_be_created() {
+    let e = compile("namespace T;\npublic abstract class A { }\npublic class P { public static main(): int { var a = new A(); return 0; } }").unwrap_err();
+    assert!(e.to_lowercase().contains("abstract"), "{}", e);
 }

@@ -146,3 +146,19 @@ fn nested_patterns_are_checked_for_exhaustiveness() {
         "missing `Ok`",
     );
 }
+
+// ---------------------------------------------------------------- v0.0.9: base(...)
+
+#[test]
+fn base_constructor_call_is_checked() {
+    ok("public class A { public constructor(x: int) { } }\npublic class B : A { public constructor() { base(1); } }");
+    fails(
+        "public class A { public constructor(x: int) { } }\npublic class B : A { public constructor() { } }",
+        "has no constructor without arguments",
+    );
+    fails(
+        "public class A { public constructor(x: int) { } }\npublic class B : A { public constructor() { var y = 1; base(y); } }",
+        "must be the first statement",
+    );
+    ok("public class A { }\npublic class B : A { }");
+}
