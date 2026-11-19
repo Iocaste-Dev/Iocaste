@@ -1,0 +1,79 @@
+// Iocaste v0.0.9-alpha: inheritance, interfaces, virtual calls.
+//   ioc run examples/shapes.ioc
+namespace Shapes;
+
+import Ioc.Console;
+
+public interface Named {
+    name(): string;
+}
+
+public abstract class Shape : Named {
+    protected label: string;
+
+    public constructor(label: string) {
+        this.label = label;
+    }
+
+    public name(): string => label;
+
+    public abstract area(): double;
+
+    public virtual describe(): string => $"{name()} area={area()}";
+}
+
+public class Rect : Shape {
+    public w: double;
+    public h: double;
+
+    public constructor(w: double, h: double) {
+        base("rect");
+        this.w = w;
+        this.h = h;
+    }
+
+    public override area(): double => w * h;
+}
+
+public class Square : Rect {
+    public constructor(s: double) {
+        base(s, s);
+    }
+
+    public override describe(): string => "square! " + base.describe();
+}
+
+public class Circle : Shape {
+    public r: double;
+
+    public constructor(r: double) {
+        base("circle");
+        this.r = r;
+    }
+
+    public override area(): double => 3.0 * r * r;
+
+    destructor() {
+        Console.println("  circle freed");
+    }
+}
+
+public class Program {
+    static show(s: ref Shape): void {
+        Console.println(s.describe());
+    }
+
+    static total(a: ref Shape, b: ref Shape): double {
+        return a.area() + b.area();
+    }
+
+    static main(): void {
+        var r = new Rect(2.0, 3.0);
+        var q = new Square(4.0);
+        var c = new Circle(2.0);
+        show(ref r);
+        show(ref q);
+        show(ref c);
+        Console.println($"total {total(ref r, ref c)}");
+    }
+}

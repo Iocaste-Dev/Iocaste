@@ -98,35 +98,139 @@ pub fn cmd_config(args: &[String]) -> i32 {
 
 pub struct Cc {
     pub cmd: String,
+    /// Arguments that come before the normal ones (`cc` for `zig cc`).
+    pub pre: Vec<String>,
     pub version: String,
+    pub managed: bool,
 }
 
-pub fn compiler_candidates() -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(c) = env::var("IOC_CC") {
-        if !c.is_empty() {
-            v.push(c);
+/// The compiler Iocaste manages itself. Pinned, so builds are the same on every machine.
+pub const ZIG_VERSION: &str = "0.13.0";
+
+fn zig_platform() -> Option<(&'static str, &'static str)> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => return None,
+    };
+    Some((os, arch))
+}
+
+pub fn toolchain_dir() -> PathBuf {
+    ioc_home().join("toolchain")
+}
+
+fn managed_zig_path() -> Option<PathBuf> {
+    let (os, arch) = zig_platform()?;
+    let exe = if cfg!(windows) { "zig.exe" } else { "zig" };
+    let p = toolchain_dir().join(format!("zig-{}-{}-{}", os, arch, ZIG_VERSION)).join(exe);
+    if p.exists() { Some(p) } else { None }
+}
+
+fn zig_url() -> Option<String> {
+    if let Ok(u) = env::var("IOC_TOOLCHAIN_URL") {
+        if !u.is_empty() {
+            return Some(u);
         }
     }
-    if let Some(c) = config_get("cc") {
-        v.push(c);
-    }
-    for c in ["cc", "gcc", "clang"] {
-        v.push(c.to_string());
-    }
-    v
+    let (os, arch) = zig_platform()?;
+    let ext = if os == "windows" { "zip" } else { "tar.xz" };
+    Some(format!("https://ziglang.org/download/{v}/zig-{os}-{arch}-{v}.{ext}", v = ZIG_VERSION, os = os, arch = arch, ext = ext))
 }
 
+fn probe(cmd: &str, pre: &[String], managed: bool) -> Option<Cc> {
+    let o = Command::new(cmd).args(pre).arg("--version").output().ok()?;
+    if !o.status.success() {
+        // `zig cc --version` is fine, but plain `zig` prints a bare version
+        return None;
+    }
+    let v = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string();
+    Some(Cc { cmd: cmd.to_string(), pre: pre.to_vec(), version: v, managed })
+}
+
+/// Order: IOC_CC, config `cc`, the compiler ioc installed itself, then whatever the system has.
 pub fn detect_cc() -> Option<Cc> {
-    for c in compiler_candidates() {
-        if let Ok(o) = Command::new(&c).arg("--version").output() {
-            if o.status.success() {
-                let v = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string();
-                return Some(Cc { cmd: c, version: v });
+    if let Ok(c) = env::var("IOC_CC") {
+        if !c.is_empty() {
+            if let Some(f) = probe(&c, &[], false) {
+                return Some(f);
             }
         }
     }
+    if let Some(c) = config_get("cc") {
+        if let Some(f) = probe(&c, &[], false) {
+            return Some(f);
+        }
+    }
+    if let Some(z) = managed_zig_path() {
+        let zs = z.to_string_lossy().to_string();
+        if let Some(mut f) = probe(&zs, &["cc".to_string()], true) {
+            f.version = format!("zig {} (installed by ioc)", ZIG_VERSION);
+            return Some(f);
+        }
+    }
+    for c in ["cc", "gcc", "clang"] {
+        if let Some(f) = probe(c, &[], false) {
+            return Some(f);
+        }
+    }
     None
+}
+
+/// Download the managed compiler into IOC_HOME/toolchain. Needs `curl` and `tar`, which ship with Windows 10+, macOS and Linux.
+pub fn install_managed_toolchain() -> Result<(), String> {
+    let Some(url) = zig_url() else {
+        return Err(format!("no managed compiler is available for {} {}", std::env::consts::OS, std::env::consts::ARCH));
+    };
+    let dir = toolchain_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+    let archive = dir.join(if url.ends_with(".zip") { "download.zip" } else { "download.tar.xz" });
+    println!("  downloading the Iocaste compiler toolchain (one time, about 80 MB)");
+    println!("    from {}", url);
+    let ok = Command::new("curl").args(["-fL", "--retry", "2", "--progress-bar", "-o"]).arg(&archive).arg(&url).status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        let _ = fs::remove_file(&archive);
+        return Err(format!("the download failed. Check your connection, or set IOC_CC to a compiler you already have.\n    (url: {})", url));
+    }
+    println!("  unpacking");
+    let ok = Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&dir).status().map(|s| s.success()).unwrap_or(false);
+    let _ = fs::remove_file(&archive);
+    if !ok {
+        return Err("could not unpack the toolchain (is `tar` installed?)".to_string());
+    }
+    match detect_managed() {
+        Some(c) => {
+            println!("  ✓ installed   {}", c.version);
+            Ok(())
+        }
+        None => Err("the toolchain was unpacked but does not run on this machine".to_string()),
+    }
+}
+
+fn detect_managed() -> Option<Cc> {
+    let z = managed_zig_path()?;
+    let mut f = probe(&z.to_string_lossy(), &["cc".to_string()], true)?;
+    f.version = format!("zig {} (installed by ioc)", ZIG_VERSION);
+    Some(f)
+}
+
+/// Used by `ioc build`: find a compiler, and if there is none, fetch one. The user never has to install anything by hand.
+pub fn cc_or_provision() -> Result<Cc, String> {
+    if let Some(c) = detect_cc() {
+        return Ok(c);
+    }
+    println!("ioc: no C compiler found. Setting up the built-in toolchain (first build only).");
+    if env::var("IOC_NO_DOWNLOAD").is_ok() {
+        return Err("IOC_NO_DOWNLOAD is set, so ioc will not fetch a compiler".to_string());
+    }
+    install_managed_toolchain()?;
+    detect_cc().ok_or_else(|| "no compiler available after install".to_string())
 }
 
 struct PkgMgr {
@@ -168,7 +272,15 @@ fn ensure_toolchain(auto: bool) -> bool {
         println!("  ✓ C compiler   {}  ({})", cc.cmd, cc.version);
         return true;
     }
-    println!("  ✗ C compiler   not found (`ioc build` needs gcc or clang)");
+    println!("  ✗ C compiler   not found");
+    if auto {
+        match install_managed_toolchain() {
+            Ok(()) => return true,
+            Err(e) => println!("      {}", e),
+        }
+    } else {
+        println!("      Run `ioc install --toolchain` and ioc will download its own compiler (no admin rights needed).");
+    }
     let Some(pm) = package_manager() else {
         println!("      Install gcc or clang with your system's package manager, then run `ioc doctor`.");
         return false;
@@ -178,8 +290,7 @@ fn ensure_toolchain(auto: bool) -> bool {
         full = format!("sudo {}", full);
     }
     if !auto {
-        println!("      Install it with ({}):\n          {}", pm.name, full);
-        println!("      or let ioc run that command:  ioc install --toolchain --yes");
+        println!("      Or install one yourself with ({}):\n          {}", pm.name, full);
         return false;
     }
     println!("      Running: {}", full);
@@ -372,7 +483,7 @@ pub fn cmd_install(args: &[String]) -> i32 {
     let toolchain_only = args.iter().any(|a| a == "--toolchain");
     let yes = args.iter().any(|a| a == "--yes" || a == "-y");
     println!("Checking what is needed to build and run Iocaste programs:");
-    let cc_ok = ensure_toolchain(toolchain_only && yes);
+    let cc_ok = ensure_toolchain(true);
     if toolchain_only {
         return if cc_ok { 0 } else { 1 };
     }
