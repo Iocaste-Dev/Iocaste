@@ -1,0 +1,57 @@
+// Iocaste v0.0.11-alpha: generic classes and methods.
+//   ioc run examples/generics.ioc
+namespace T;
+import Ioc.Console;
+import Ioc.Collections;
+
+public class Res {
+    public id: int;
+    public constructor(id: int) { this.id = id; }
+    destructor() { Console.println($"free {id}"); }
+}
+
+public class Box<T> {
+    public value: T;
+    public constructor(value: T) { this.value = value; }
+    public get(): ref T => ref value;
+    public set(v: T): void { value = v; }
+}
+
+public class Stack<T> {
+    private items: List<T>;
+    public constructor() { this.items = new List<T>(); }
+    public push(x: T): void { items.add(x); }
+    public size(): int => items.count;
+    public peek(): ref T => ref items.get(items.count - 1);
+}
+
+public class Pair<A, B> {
+    public first: A;
+    public second: B;
+    public constructor(a: A, b: B) { this.first = a; this.second = b; }
+    public describe(): string => $"({first}, {second})";
+}
+
+public class Util {
+    public static twice<T>(b: ref Box<T>): ref T { return b.get(); }
+    public static pick<T>(a: T, b: T, first: bool): T { if (first) { return a; } return b; }
+}
+
+public class Program {
+    public static main(args: string[]): int {
+        let bi = new Box<int>(41);
+        bi.set(bi.get() + 1);
+        let bs = new Box<string>("hi");
+        Console.println($"{bi.get()} {bs.get()}");
+        let p = new Pair<string, int>("a", 2);
+        Console.println(p.describe());
+        let st = new Stack<Res>();
+        st.push(new Res(1));
+        st.push(new Res(2));
+        Console.println($"size {st.size()} top {st.peek().id}");
+        let br = new Box<Res>(new Res(7));
+        Console.println($"boxed {br.get().id}");
+        Console.println($"{Util.twice(ref bi)} {Util.pick(3, 9, false)} {Util.pick("x", "y", true)}");
+        return 0;
+    }
+}

@@ -130,6 +130,7 @@ struct Method<'a> {
     body: &'a Body,
     span: Span,
     file: usize,
+    subst: Vec<(String, CT)>,
 }
 
 #[allow(dead_code)]
@@ -163,6 +164,8 @@ struct Class<'a> {
     is_abstract: bool,
     /// a `List<T>` instance: the element type (the list is generated, not declared)
     list_elem: Option<CT>,
+    /// for an instance of a generic class: what each type parameter stands for
+    subst: Vec<(String, CT)>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -231,6 +234,11 @@ struct Gen<'a> {
     ret: CT,
     out: String,
     ind: usize,
+    subst: Vec<(String, CT)>,
+    generics: Vec<(&'a TypeDecl, usize)>,
+    gmethods: Vec<(usize, &'a MethodDecl)>,
+    insts: Vec<(String, Vec<CT>, usize)>,
+    minsts: Vec<(usize, Vec<CT>)>,
 }
 
 impl<'a> Gen<'a> {
@@ -303,6 +311,101 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// One concrete copy of the generic class `name` for these type arguments (made the first time it is needed).
+    fn instantiate(&mut self, name: &str, args: Vec<CT>) -> Option<usize> {
+        if let Some(x) = self.insts.iter().find(|i| i.0 == name && i.1 == args) {
+            return Some(x.2);
+        }
+        let (decl, file) = *self.generics.iter().find(|(d, _)| d.name == name && d.generics.len() == args.len())?;
+        if args.iter().any(|a| matches!(a, CT::Void | CT::StrArr | CT::Ref(_))) {
+            return None;
+        }
+        let ci = self.classes.len();
+        let subst: Vec<(String, CT)> = decl.generics.iter().map(|g| g.name.clone()).zip(args.iter().copied()).collect();
+        self.classes.push(Class {
+            name: format!("{}<{}>", name, args.iter().map(|a| a.c()).collect::<Vec<_>>().join(",")),
+            file,
+            span: decl.span,
+            fields: Vec::new(),
+            ctors: Vec::new(),
+            dtor: None,
+            base: None,
+            ifaces: Vec::new(),
+            is_interface: decl.kind == TypeKind::Interface,
+            is_abstract: decl.modifiers.contains(Modifier::Abstract),
+            list_elem: None,
+            subst: subst.clone(),
+        });
+        self.insts.push((name.to_string(), args, ci));
+        let saved = (std::mem::replace(&mut self.subst, subst), self.file);
+        self.file = file;
+        let mut next = ci;
+        self.collect_type(decl, &mut next);
+        self.subst = saved.0;
+        self.file = saved.1;
+        Some(ci)
+    }
+
+    /// Bind the type parameters in `t` by matching it against the type of an argument.
+    fn unify(&self, t: &TypeRef, ct: CT, names: &[String], out: &mut Vec<(String, CT)>) {
+        match &t.kind {
+            TypeRefKind::Named { path, args } => {
+                let last = path.last().map(|s| s.as_str()).unwrap_or("");
+                if args.is_empty() {
+                    if path.len() == 1 && names.iter().any(|n| n == last) && !out.iter().any(|o| o.0 == last) {
+                        let ct = if let CT::Ref(c) = ct { CT::Obj(c) } else { ct };
+                        out.push((last.to_string(), ct));
+                    }
+                    return;
+                }
+                if let CT::Obj(ci) | CT::Ref(ci) = ct {
+                    if last == "List" && args.len() == 1 {
+                        if let Some(e) = self.classes[ci].list_elem {
+                            self.unify(&args[0], e, names, out);
+                        }
+                        return;
+                    }
+                    if let Some(inst) = self.insts.iter().find(|i| i.2 == ci && i.0 == last) {
+                        for (a, c) in args.iter().zip(inst.1.iter()) {
+                            self.unify(a, *c, names, out);
+                        }
+                    }
+                }
+            }
+            TypeRefKind::Ref { inner, .. } => self.unify(inner, ct, names, out),
+            _ => {}
+        }
+    }
+
+    /// Make the concrete copy of a generic method for the types of these arguments.
+    fn instantiate_method(&mut self, owner: usize, md: &'a MethodDecl, av: &[Arg]) {
+        let names: Vec<String> = md.generics.iter().map(|g| g.name.clone()).collect();
+        let mut bound: Vec<(String, CT)> = Vec::new();
+        for (p, a) in md.params.iter().zip(av.iter()) {
+            self.unify(&p.ty, a.ct, &names, &mut bound);
+        }
+        let mut targs = Vec::new();
+        for n in &names {
+            match bound.iter().find(|b| &b.0 == n) {
+                Some(b) => targs.push(b.1),
+                None => return,
+            }
+        }
+        let key = md as *const MethodDecl as usize;
+        if self.minsts.iter().any(|m| m.0 == key && m.1 == targs) {
+            return;
+        }
+        self.minsts.push((key, targs));
+        let mut subst = self.classes[owner].subst.clone();
+        subst.extend(bound);
+        let saved = (std::mem::replace(&mut self.subst, subst), self.file);
+        self.file = self.classes[owner].file;
+        let cname = self.classes[owner].name.clone();
+        self.collect_method(owner, &cname, md);
+        self.subst = saved.0;
+        self.file = saved.1;
+    }
+
     /// The generated class for `List<elem>` (created the first time it is used).
     fn list_of(&mut self, elem: CT) -> Option<usize> {
         if matches!(elem, CT::Void | CT::StrArr | CT::Ref(_)) {
@@ -323,6 +426,7 @@ impl<'a> Gen<'a> {
             is_interface: false,
             is_abstract: false,
             list_elem: Some(elem),
+            subst: Vec::new(),
         });
         Some(self.classes.len() - 1)
     }
@@ -332,6 +436,9 @@ impl<'a> Gen<'a> {
             TypeRefKind::Named { path, args } => {
                 let last = path.last()?.as_str();
                 if path.len() == 1 && args.is_empty() {
+                    if let Some((_, c)) = self.subst.iter().find(|s| s.0 == last) {
+                        return Some(*c);
+                    }
                     if let Some(p) = Self::prim_ct(last) {
                         return Some(p);
                     }
@@ -350,7 +457,11 @@ impl<'a> Gen<'a> {
                     return self.list_of(e).map(CT::Obj);
                 }
                 if !args.is_empty() {
-                    return None;
+                    let mut cts = Vec::new();
+                    for a in args {
+                        cts.push(self.type_ct(a)?);
+                    }
+                    return self.instantiate(last, cts).map(CT::Obj);
                 }
                 if let Some(e) = self.find_enum(last) {
                     return Some(CT::Enum(e));
@@ -365,8 +476,10 @@ impl<'a> Gen<'a> {
                 Some(CT::Str) => Some(CT::StrArr),
                 _ => None,
             },
-            TypeRefKind::Ref { inner, .. } => match self.type_ct(inner) {
+            TypeRefKind::Ref { inner, mutable } => match self.type_ct(inner) {
                 Some(CT::Obj(i)) => Some(CT::Ref(i)),
+                // a read-only borrow of a plain value is just a copy of it
+                Some(c) if !*mutable && !matches!(c, CT::Void | CT::StrArr | CT::Ref(_)) => Some(c),
                 _ => None,
             },
         }
@@ -388,6 +501,7 @@ impl<'a> Gen<'a> {
             },
             TyInfo::Ref(i) => match self.info_ct(i)? {
                 CT::Obj(c) => Some(CT::Ref(c)),
+                c if !matches!(c, CT::Void | CT::StrArr | CT::Ref(_)) => Some(c),
                 _ => None,
             },
             TyInfo::Named(n, args) => match (n.as_str(), args.len()) {
@@ -403,6 +517,14 @@ impl<'a> Gen<'a> {
                 ("List", 1) => {
                     let e = self.info_ct(&args[0])?;
                     self.list_of(e).map(CT::Obj)
+                }
+                (name, 0) if self.subst.iter().any(|s| s.0 == name) => self.subst.iter().find(|s| s.0 == name).map(|s| s.1),
+                (name, n) if n > 0 => {
+                    let mut cts = Vec::new();
+                    for a in args {
+                        cts.push(self.info_ct(a)?);
+                    }
+                    self.instantiate(name, cts).map(CT::Obj)
                 }
                 (name, 0) => self.find_enum(name).map(CT::Enum).or_else(|| self.find_class(name).map(CT::Obj)),
                 _ => None,
@@ -454,6 +576,11 @@ pub fn generate(files: &[&SourceFile], types: &TypeTable) -> Result<String, Vec<
         ret: CT::Void,
         out: String::new(),
         ind: 0,
+        subst: Vec::new(),
+        generics: Vec::new(),
+        gmethods: Vec::new(),
+        insts: Vec::new(),
+        minsts: Vec::new(),
     };
     // pass 1: class names (so types can refer to each other in any order)
     for (i, f) in files.iter().enumerate() {
@@ -496,18 +623,22 @@ pub fn generate(files: &[&SourceFile], types: &TypeTable) -> Result<String, Vec<
     }
 
     // bodies first: generating them may create more Option / Result instances
-    let mut i = 0;
-    while i < g.classes.len() {
-        g.emit_class(i);
-        i += 1;
-    }
-    for i in 0..g.methods.len() {
-        g.emit_method(i);
-    }
-    // method bodies may have created more List<T> classes
-    while i < g.classes.len() {
-        g.emit_class(i);
-        i += 1;
+    let (mut ci, mut mi) = (0, 0);
+    loop {
+        let mut did = false;
+        while ci < g.classes.len() {
+            g.emit_class(ci);
+            ci += 1;
+            did = true;
+        }
+        while mi < g.methods.len() {
+            g.emit_method(mi);
+            mi += 1;
+            did = true;
+        }
+        if !did {
+            break;
+        }
     }
     if !g.errors.is_empty() {
         return Err(g.errors);
@@ -575,7 +706,7 @@ impl<'a> Gen<'a> {
     fn unsupported(&mut self, span: Span, what: &str) {
         self.errors.push(CError {
             file: self.file,
-            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.10)", what), span)
+            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.11)", what), span)
                 .with_hint("`ioc check` still validates it; code generation for it arrives in the next versions"),
         });
     }
@@ -623,6 +754,10 @@ impl<'a> Gen<'a> {
     }
 
     fn register_type(&mut self, t: &'a TypeDecl) {
+        if matches!(t.kind, TypeKind::Class | TypeKind::Interface) && !t.generics.is_empty() {
+            self.generics.push((t, self.file));
+            return;
+        }
         if matches!(t.kind, TypeKind::Class | TypeKind::Interface) && t.generics.is_empty() {
             self.classes.push(Class {
                 name: t.name.clone(),
@@ -636,6 +771,7 @@ impl<'a> Gen<'a> {
                 is_interface: t.kind == TypeKind::Interface,
                 is_abstract: t.modifiers.contains(Modifier::Abstract),
                 list_elem: None,
+                subst: Vec::new(),
             });
         }
     }
@@ -646,6 +782,7 @@ impl<'a> Gen<'a> {
                 Item::Namespace(n) => self.collect_items(&n.items, next_class),
                 Item::Import(_) => {}
                 Item::Enum(e) => self.collect_enum(e),
+                Item::Type(t) if !t.generics.is_empty() => {}
                 Item::Type(t) => self.collect_type(t, next_class),
             }
         }
@@ -654,10 +791,6 @@ impl<'a> Gen<'a> {
     fn collect_type(&mut self, t: &'a TypeDecl, next_class: &mut usize) {
         if !matches!(t.kind, TypeKind::Class | TypeKind::Interface) {
             self.unsupported(t.span, if t.kind == TypeKind::Struct { "`struct`" } else { "`record`" });
-            return;
-        }
-        if !t.generics.is_empty() {
-            self.unsupported(t.span, "a generic class");
             return;
         }
         let ci = *next_class;
@@ -681,6 +814,7 @@ impl<'a> Gen<'a> {
                 continue;
             }
             match m {
+                Member::Method(md) if !md.generics.is_empty() => self.gmethods.push((ci, md)),
                 Member::Method(md) => self.collect_method(ci, &t.name, md),
                 Member::Field(f) => {
                     if f.modifiers.contains(Modifier::Static) {
@@ -763,15 +897,12 @@ impl<'a> Gen<'a> {
             body: &get.body,
             span: p.span,
             file: self.file,
+            subst: self.subst.clone(),
         });
         self.classes[ci].fields.push(FieldI { name: p.name.clone(), ct, init: None, getter: Some(k), span: p.span });
     }
 
     fn collect_method(&mut self, ci: usize, class: &str, md: &'a MethodDecl) {
-        if !md.generics.is_empty() {
-            self.unsupported(md.span, "a generic method");
-            return;
-        }
         if md.modifiers.contains(Modifier::Async) {
             self.unsupported(md.span, "`async`");
             return;
@@ -816,6 +947,7 @@ impl<'a> Gen<'a> {
             body: &md.body,
             span: md.span,
             file: self.file,
+            subst: self.subst.clone(),
         });
     }
 
@@ -1137,6 +1269,7 @@ impl<'a> Gen<'a> {
 
     fn emit_class(&mut self, ci: usize) {
         self.file = self.classes[ci].file;
+        self.subst = self.classes[ci].subst.clone();
         self.class = Some(ci);
         self.in_static = false;
         self.ret = CT::Void;
@@ -1328,6 +1461,7 @@ impl<'a> Gen<'a> {
             (m.file, m.class_idx, m.ret, m.body, m.span, m.is_static)
         };
         self.file = file;
+        self.subst = self.methods[i].subst.clone();
         self.class = Some(ci);
         self.in_static = is_static;
         self.ctx = Ctx::Method;
@@ -1768,10 +1902,12 @@ impl<'a> Gen<'a> {
                 let o = if *op == PostOp::Inc { "++" } else { "--" };
                 Some((format!("({}{})", c, o), t))
             }
-            ExprKind::Borrow { expr, .. } => {
+            ExprKind::Borrow { expr, mutable } => {
                 let (c, t) = self.expr(expr)?;
                 match t {
                     CT::Obj(i) | CT::Ref(i) => Some((c, CT::Ref(i))),
+                    CT::Str | CT::Bool | CT::Char | CT::Enum(_) if !*mutable => Some((c, t)),
+                    t if t.is_num() && !*mutable => Some((c, t)),
                     _ => {
                         self.unsupported(e.span, "`ref` / `mut ref` of a number or string");
                         None
@@ -2104,6 +2240,10 @@ impl<'a> Gen<'a> {
     fn user_call(&mut self, ci: usize, name: &str, av: Vec<Arg>, recv: Option<String>, span: Span) -> Option<(String, CT)> {
         if let Some(el) = self.classes[ci].list_elem {
             return self.list_call(ci, el, name, av, recv, span);
+        }
+        let gm: Vec<(usize, &'a MethodDecl)> = self.gmethods.iter().filter(|(c, md)| md.name == name && self.chain(ci).contains(c)).copied().collect();
+        for (owner, md) in gm {
+            self.instantiate_method(owner, md, &av);
         }
         // methods visible on `ci`: its own first, then inherited ones; an override hides the method it replaces
         let mut cands: Vec<(usize, Vec<CT>)> = Vec::new();

@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.0.11-alpha (Step 11): generic classes and methods
+
+- **Generic classes**: `class Box<T>`, `class Pair<A, B>`, `class Stack<T>` holding a `List<T>`. Each set of type arguments gets its own compiled copy (no runtime cost, no boxing), made the first time it is used.
+- **Generic methods**: `static pick<T>(a: T, b: T, first: bool): T`. The type argument is inferred from the call's arguments.
+- Works with objects: `Box<Res>` owns its `Res` and frees it; `Slot<Animal>` holding a `Dog` frees it through the real class. Checked under AddressSanitizer.
+- A read-only `ref` of a number, `bool`, `char`, `string` or enum is now allowed and is just a copy (this is what makes `get(): ref T` work for every `T`).
+- Rules from the checker apply as before: a `T` cannot be compared with `>` unless constrained, and returning an object-valued `T` out of a field needs `ref`.
+- New example: `examples/generics.ioc`.
+
+Not yet: generic enums and interfaces, explicit type arguments on a call (`f<int>(x)`), `Dictionary<K,V>`. Still for v0.1.0: `shared<T>`, `Channel<T>`, `spawn`.
+
 ## v0.0.10-alpha (Step 10): List<T> and `for ... in`
 
 - **`List<T>`** works in the backend for numbers, `bool`, `char`, `string`, class objects and interface objects: `new List<Shape>()`, `add`, `get`, `set`, `removeAt`, `clear`, `contains` (not for objects), `count`, and `list[i]`. Out-of-range indexes stop the program with a message.
