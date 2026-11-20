@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.0.10-alpha (Step 10): List<T> and `for ... in`
+
+- **`List<T>`** works in the backend for numbers, `bool`, `char`, `string`, class objects and interface objects: `new List<Shape>()`, `add`, `get`, `set`, `removeAt`, `clear`, `contains` (not for objects), `count`, and `list[i]`. Out-of-range indexes stop the program with a message.
+- **Ownership**: a list owns its objects. `add(new X())` moves the object in; `get` / `[i]` / loop variables only borrow it (`ref`). Replacing, removing, clearing or dropping the list frees the objects (through the real class's destructor), once. Checked under AddressSanitizer.
+- **`for (let x in list)`** and **`for (let a in args)`**. The loop variable borrows; loop over a variable or field.
+- `examples/typed.ioc` (lists of interface objects) now builds and runs. New example: `examples/lists.ioc`.
+
+Not yet: `Dictionary<K,V>`, lists of lists / enums / `Option`, user-written generic classes and methods, `shared<T>`, `Channel<T>`, `spawn` (so `hello.ioc` still only checks). Those are v0.1.0.
+
 ## v0.0.9-alpha (Step 9): inheritance, interfaces, and a self-contained toolchain
 
 **No C compiler needed any more.** The first `ioc build` / `ioc run` on a machine without a compiler downloads one (Zig 0.13.0, pinned) into `~/.ioc/toolchain` and uses it from then on. No admin rights, nothing to install by hand. `ioc install --toolchain` does the same step on demand.

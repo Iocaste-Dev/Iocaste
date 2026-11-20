@@ -453,3 +453,55 @@ fn abstract_classes_and_interfaces_cannot_be_created() {
     let e = compile("namespace T;\npublic abstract class A { }\npublic class P { public static main(): int { var a = new A(); return 0; } }").unwrap_err();
     assert!(e.to_lowercase().contains("abstract"), "{}", e);
 }
+
+// ---------------------------------------------------------------- v0.0.10: List<T>
+
+#[test]
+fn lists_own_and_free_their_elements() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/lists.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(
+        out,
+        "count 10 sum 285 third 9 idx 16\nhas 49: true has 50: false\nfirst 100 count 9\na\nbb\nfree 2\nsee 1\nsee 3\nfree 1\nend\nfree 9\nfree 3\n"
+    );
+}
+
+#[test]
+fn typed_example_builds_and_runs() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/typed.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "circle: 12.56636\nshape: 12\ntotal 24.56636\nmove 1,2\nhalf = 5\n");
+}
+
+#[test]
+fn list_of_base_class_frees_derived_objects_correctly() {
+    if !have_cc() { return; }
+    let body = "let l = new List<Animal>(); l.add(new Dog(1)); l.add(new Cat(2)); for (let a in l) { Console.println(a.speak()); }";
+    let src = top(ANIMALS, body).replace("import Ioc.Console;", "import Ioc.Console;\nimport Ioc.Collections;");
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.matches("free dog 1").count(), 1, "{}", out);
+    assert_eq!(out.matches("free animal 1").count(), 1, "{}", out);
+    assert_eq!(out.matches("free animal 2").count(), 1, "{}", out);
+}
+
+#[test]
+fn list_index_out_of_range_stops_the_program() {
+    if !have_cc() { return; }
+    let src = program("let l = new List<int>(); l.add(1); Console.println($\"{l[5]}\");", "").replace("import Ioc.Math;", "import Ioc.Math;\nimport Ioc.Collections;");
+    let (code, _, err) = run(&src);
+    assert_ne!(code, 0);
+    assert!(err.contains("index out of range"), "{}", err);
+}
+
+#[test]
+fn for_in_over_the_program_arguments() {
+    if !have_cc() { return; }
+    let (code, out, _) = run(&program("var n = 0; for (let a in args) { n += 1; } Console.println($\"{n}\");", ""));
+    assert_eq!(code, 0);
+    assert_eq!(out, "0\n");
+}

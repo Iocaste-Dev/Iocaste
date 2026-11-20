@@ -1,0 +1,37 @@
+// Iocaste v0.0.10-alpha: List<T> that owns its elements.
+//   ioc run examples/lists.ioc
+namespace T;
+import Ioc.Console;
+import Ioc.Collections;
+
+public class Res {
+    public id: int;
+    public constructor(id: int) { this.id = id; }
+    destructor() { Console.println($"free {id}"); }
+}
+
+public class Program {
+    public static main(args: string[]): int {
+        let nums = new List<int>();
+        for (var i = 0; i < 10; i++) { nums.add(i * i); }
+        var sum = 0;
+        for (let n in nums) { sum += n; }
+        Console.println($"count {nums.count} sum {sum} third {nums.get(3)} idx {nums[4]}");
+        Console.println($"has 49: {nums.contains(49)} has 50: {nums.contains(50)}");
+        nums.removeAt(0);
+        nums.set(0, 100);
+        Console.println($"first {nums[0]} count {nums.count}");
+
+        let words = new List<string>();
+        words.add("a"); words.add("bb");
+        for (let w in words) { Console.println(w); }
+
+        let rs = new List<Res>();
+        rs.add(new Res(1)); rs.add(new Res(2)); rs.add(new Res(3));
+        rs.removeAt(1);
+        for (let r in rs) { Console.println($"see {r.id}"); }
+        rs.set(0, new Res(9));
+        Console.println("end");
+        return 0;
+    }
+}
