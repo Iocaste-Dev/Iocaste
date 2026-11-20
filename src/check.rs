@@ -1296,6 +1296,7 @@ impl<'p, 'a> Checker<'p, 'a> {
             Ty::Array(i) => TyInfo::Array(Box::new(self.to_info(&i))),
             Ty::Ref { inner, .. } => TyInfo::Ref(Box::new(self.to_info(&inner))),
             Ty::Void => TyInfo::Void,
+            Ty::Param(p) => TyInfo::Named(prog.param_names[p as usize].clone(), Vec::new()),
             _ => TyInfo::Unknown,
         }
     }

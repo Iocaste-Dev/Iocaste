@@ -505,3 +505,45 @@ fn for_in_over_the_program_arguments() {
     assert_eq!(code, 0);
     assert_eq!(out, "0\n");
 }
+
+// ---------------------------------------------------------------- v0.0.11: generics
+
+#[test]
+fn generics_example_runs_and_frees_everything_once() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/generics.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "42 hi\n(a, 2)\nsize 2 top 2\nboxed 7\n42 9 x\nfree 7\nfree 1\nfree 2\n");
+}
+
+#[test]
+fn each_type_argument_gets_its_own_copy() {
+    if !have_cc() { return; }
+    let types = "public class Cell<T> { public v: T; public constructor(v: T) { this.v = v; } public get(): ref T => ref v; }";
+    let body = "let a = new Cell<int>(1); let b = new Cell<double>(2.5); let c = new Cell<bool>(true); Console.println($\"{a.get()} {b.get()} {c.get()}\");";
+    let (code, out, err) = run_asan(&top(types, body));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "1 2.5 true\n");
+}
+
+#[test]
+fn generic_class_can_hold_a_derived_object_through_its_base() {
+    if !have_cc() { return; }
+    let types = format!("{}\npublic class Slot<T> {{ public item: T; public constructor(item: T) {{ this.item = item; }} }}", ANIMALS);
+    let body = "let s = new Slot<Animal>(new Dog(4)); Console.println(s.item.speak());";
+    let (code, out, err) = run_asan(&top(&types, body));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.matches("free dog 4").count(), 1, "{}", out);
+    assert_eq!(out.matches("free animal 4").count(), 1, "{}", out);
+}
+
+#[test]
+fn generic_method_infers_its_type_from_the_arguments() {
+    if !have_cc() { return; }
+    let types = "public class U { public static pick<T>(a: T, b: T, first: bool): T { if (first) { return a; } return b; } }";
+    let body = "let s = U.pick(\"p\", \"q\", true); Console.println($\"{U.pick(1, 2, false)} {s} {U.pick(1.5, 2.5, true)}\");";
+    let (code, out, err) = run_asan(&top(types, body));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "2 p 1.5\n");
+}
