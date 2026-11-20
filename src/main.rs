@@ -88,7 +88,7 @@ COMMANDS:
 
 `ioc help <command>` explains one command.
 
-Coming next: generics, tasks and channels (v0.1.0)."
+Coming next: user generics, `shared<T>`, tasks and channels (v0.1.0)."
     );
 }
 

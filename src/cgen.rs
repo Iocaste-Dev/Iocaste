@@ -161,6 +161,8 @@ struct Class<'a> {
     ifaces: Vec<usize>,
     is_interface: bool,
     is_abstract: bool,
+    /// a `List<T>` instance: the element type (the list is generated, not declared)
+    list_elem: Option<CT>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -301,6 +303,30 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// The generated class for `List<elem>` (created the first time it is used).
+    fn list_of(&mut self, elem: CT) -> Option<usize> {
+        if matches!(elem, CT::Void | CT::StrArr | CT::Ref(_)) {
+            return None;
+        }
+        if let Some(i) = self.classes.iter().position(|c| c.list_elem == Some(elem)) {
+            return Some(i);
+        }
+        self.classes.push(Class {
+            name: format!("List<{}>", elem.c()),
+            file: self.file,
+            span: Span::new(1, 1),
+            fields: Vec::new(),
+            ctors: Vec::new(),
+            dtor: None,
+            base: None,
+            ifaces: Vec::new(),
+            is_interface: false,
+            is_abstract: false,
+            list_elem: Some(elem),
+        });
+        Some(self.classes.len() - 1)
+    }
+
     fn type_ct(&mut self, t: &TypeRef) -> Option<CT> {
         match &t.kind {
             TypeRefKind::Named { path, args } => {
@@ -318,6 +344,10 @@ impl<'a> Gen<'a> {
                     let a = self.type_ct(&args[0])?;
                     let b = self.type_ct(&args[1])?;
                     return self.result_of(a, b).map(CT::Enum);
+                }
+                if args.len() == 1 && last == "List" {
+                    let e = self.type_ct(&args[0])?;
+                    return self.list_of(e).map(CT::Obj);
                 }
                 if !args.is_empty() {
                     return None;
@@ -369,6 +399,10 @@ impl<'a> Gen<'a> {
                     let a = self.info_ct(&args[0])?;
                     let b = self.info_ct(&args[1])?;
                     self.result_of(a, b).map(CT::Enum)
+                }
+                ("List", 1) => {
+                    let e = self.info_ct(&args[0])?;
+                    self.list_of(e).map(CT::Obj)
                 }
                 (name, 0) => self.find_enum(name).map(CT::Enum).or_else(|| self.find_class(name).map(CT::Obj)),
                 _ => None,
@@ -462,11 +496,18 @@ pub fn generate(files: &[&SourceFile], types: &TypeTable) -> Result<String, Vec<
     }
 
     // bodies first: generating them may create more Option / Result instances
-    for i in 0..g.classes.len() {
+    let mut i = 0;
+    while i < g.classes.len() {
         g.emit_class(i);
+        i += 1;
     }
     for i in 0..g.methods.len() {
         g.emit_method(i);
+    }
+    // method bodies may have created more List<T> classes
+    while i < g.classes.len() {
+        g.emit_class(i);
+        i += 1;
     }
     if !g.errors.is_empty() {
         return Err(g.errors);
@@ -534,7 +575,7 @@ impl<'a> Gen<'a> {
     fn unsupported(&mut self, span: Span, what: &str) {
         self.errors.push(CError {
             file: self.file,
-            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.9)", what), span)
+            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.10)", what), span)
                 .with_hint("`ioc check` still validates it; code generation for it arrives in the next versions"),
         });
     }
@@ -594,6 +635,7 @@ impl<'a> Gen<'a> {
                 ifaces: Vec::new(),
                 is_interface: t.kind == TypeKind::Interface,
                 is_abstract: t.modifiers.contains(Modifier::Abstract),
+                list_elem: None,
             });
         }
     }
@@ -832,6 +874,9 @@ impl<'a> Gen<'a> {
             match c.base {
                 Some(b) => s.push_str(&format!("    ioc_c{} b_;\n", b)),
                 None => s.push_str("    int ioc_cls;\n"),
+            }
+            if let Some(e) = c.list_elem {
+                s.push_str(&format!("    {}* d;\n    int32_t n;\n    int32_t cap;\n", e.c()));
             }
             for f in &c.fields {
                 if f.getter.is_none() {
@@ -1122,6 +1167,12 @@ impl<'a> Gen<'a> {
                 .collect();
             for (n, j) in owned {
                 self.line(&format!("ioc_drop_{}(v_this->f_{});", j, n));
+            }
+            if let Some(e) = self.classes[ci].list_elem {
+                if let CT::Obj(j) = e {
+                    self.line(&format!("for (int32_t ioc_i = 0; ioc_i < v_this->n; ioc_i++) ioc_drop_{}(v_this->d[ioc_i]);", j));
+                }
+                self.line("free(v_this->d);");
             }
             if let Some(b) = self.classes[ci].base {
                 self.line(&format!("ioc_dtor_{0}((ioc_c{0} *)v_this);", b));
@@ -1428,7 +1479,43 @@ impl<'a> Gen<'a> {
                 self.ind -= 1;
                 self.line("}");
             }
-            StmtKind::ForIn { iter, .. } => self.unsupported(iter.span, "`for ... in`"),
+            StmtKind::ForIn { name, iter, body, .. } => {
+                if !matches!(iter.kind, ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::This) {
+                    self.unsupported(iter.span, "`for ... in` over this expression (loop over a variable or field)");
+                    return;
+                }
+                let Some((c, t)) = self.expr(iter) else { return };
+                let (len, item, vt): (String, String, CT) = match t {
+                    CT::StrArr => (format!("ioc_it_{}.length", name), format!("ioc_it_{}.items[ioc_i_{}]", name, name), CT::Str),
+                    CT::Obj(ci) | CT::Ref(ci) if self.classes[ci].list_elem.is_some() => {
+                        let el = self.classes[ci].list_elem.unwrap();
+                        let vt = if let CT::Obj(j) = el { CT::Ref(j) } else { el };
+                        (format!("ioc_it_{}->n", name), format!("ioc_it_{}->d[ioc_i_{}]", name, name), vt)
+                    }
+                    _ => {
+                        self.unsupported(iter.span, "`for ... in` over this type");
+                        return;
+                    }
+                };
+                self.line("{");
+                self.ind += 1;
+                self.push_scope();
+                self.line(&format!("{} ioc_it_{} = {};", t.c(), name, c));
+                self.line(&format!("for (int64_t ioc_i_{n} = 0; ioc_i_{n} < {l}; ioc_i_{n}++) {{", n = name, l = len));
+                self.ind += 1;
+                self.push_scope();
+                self.declare(name, vt);
+                self.line(&format!("{} v_{} = {};", vt.c(), name, item));
+                self.loop_bases.push(self.scopes.len() - 1);
+                self.sub(body);
+                self.loop_bases.pop();
+                self.pop_scope();
+                self.ind -= 1;
+                self.line("}");
+                self.pop_scope();
+                self.ind -= 1;
+                self.line("}");
+            }
             StmtKind::Return(v) => match v {
                 Some(e) => {
                     if let Some(val) = self.owned_value_as(e, Some(self.ret)) {
@@ -1529,6 +1616,9 @@ impl<'a> Gen<'a> {
 
     /// Field (or property) `name` of class `ci`, read through `obj`.
     fn field_of(&mut self, obj: String, ci: usize, name: &str, span: Span) -> Option<(String, CT)> {
+        if self.classes[ci].list_elem.is_some() && name == "count" {
+            return Some((format!("((int32_t)({})->n)", obj), CT::I32));
+        }
         let Some((owner, fi)) = self.find_field(ci, name) else {
             self.unsupported(span, &format!("the member `{}`", name));
             return None;
@@ -1634,6 +1724,11 @@ impl<'a> Gen<'a> {
             ExprKind::Index { target, index } => {
                 let (c, t) = self.expr(target)?;
                 let (i, it) = self.expr(index)?;
+                if let (CT::Obj(ci) | CT::Ref(ci), true) = (t, it.is_int()) {
+                    if let Some(el) = self.classes[ci].list_elem {
+                        return Some(self.list_get(ci, el, &c, &i));
+                    }
+                }
                 if t != CT::StrArr || !it.is_int() {
                     self.unsupported(e.span, "indexing this value");
                     return None;
@@ -1944,7 +2039,72 @@ impl<'a> Gen<'a> {
         }
     }
 
+    fn list_get(&mut self, ci: usize, el: CT, recv: &str, idx: &str) -> (String, CT) {
+        let rt = if let CT::Obj(j) = el { CT::Ref(j) } else { el };
+        (
+            format!("({{ ioc_c{ci} *ioc_l = {r}; int64_t ioc_i = (int64_t)({i}); if (ioc_i < 0 || ioc_i >= ioc_l->n) ioc_panic(\"index out of range\"); ioc_l->d[ioc_i]; }})", ci = ci, r = recv, i = idx),
+            rt,
+        )
+    }
+
+    fn list_call(&mut self, ci: usize, el: CT, name: &str, av: Vec<Arg>, recv: Option<String>, span: Span) -> Option<(String, CT)> {
+        let Some(r) = recv else {
+            self.err(span, format!("`{}` needs a list", name));
+            return None;
+        };
+        let drop_one = |idx: &str| -> String {
+            match el {
+                CT::Obj(j) => format!("ioc_drop_{}(ioc_l->d[{}]);", j, idx),
+                _ => String::new(),
+            }
+        };
+        let ec = el.c();
+        let bad = |g: &mut Self| {
+            g.err(span, format!("the backend found no `List` method `{}` taking these arguments", name));
+            None
+        };
+        match (name, av.len()) {
+            ("add", 1) => {
+                let x = self.arg_for(&av[0], el)?;
+                Some((
+                    format!("({{ ioc_c{ci} *ioc_l = {r}; {ec} ioc_v = {x}; if (ioc_l->n == ioc_l->cap) {{ ioc_l->cap = ioc_l->cap ? ioc_l->cap * 2 : 4; ioc_l->d = ({ec} *)realloc(ioc_l->d, sizeof({ec}) * (size_t)ioc_l->cap); if (!ioc_l->d) ioc_panic(\"out of memory\"); }} ioc_l->d[ioc_l->n++] = ioc_v; (void)0; }})", ci = ci, r = r, ec = ec, x = x),
+                    CT::Void,
+                ))
+            }
+            ("get", 1) if av[0].ct.is_int() => Some(self.list_get(ci, el, &r, &av[0].code)),
+            ("set", 2) if av[0].ct.is_int() => {
+                let x = self.arg_for(&av[1], el)?;
+                Some((
+                    format!("({{ ioc_c{ci} *ioc_l = {r}; int64_t ioc_i = (int64_t)({i}); {ec} ioc_v = {x}; if (ioc_i < 0 || ioc_i >= ioc_l->n) ioc_panic(\"index out of range\"); {d} ioc_l->d[ioc_i] = ioc_v; (void)0; }})", ci = ci, r = r, i = av[0].code, ec = ec, x = x, d = drop_one("ioc_i")),
+                    CT::Void,
+                ))
+            }
+            ("removeAt", 1) if av[0].ct.is_int() => Some((
+                format!("({{ ioc_c{ci} *ioc_l = {r}; int64_t ioc_i = (int64_t)({i}); if (ioc_i < 0 || ioc_i >= ioc_l->n) ioc_panic(\"index out of range\"); {d} memmove(ioc_l->d + ioc_i, ioc_l->d + ioc_i + 1, sizeof({ec}) * (size_t)(ioc_l->n - ioc_i - 1)); ioc_l->n--; (void)0; }})", ci = ci, r = r, i = av[0].code, ec = ec, d = drop_one("ioc_i")),
+                CT::Void,
+            )),
+            ("clear", 0) => {
+                let d = match el {
+                    CT::Obj(j) => format!("for (int32_t ioc_k = 0; ioc_k < ioc_l->n; ioc_k++) ioc_drop_{}(ioc_l->d[ioc_k]);", j),
+                    _ => String::new(),
+                };
+                Some((format!("({{ ioc_c{ci} *ioc_l = {r}; {d} ioc_l->n = 0; (void)0; }})", ci = ci, r = r, d = d), CT::Void))
+            }
+            ("contains", 1) if !matches!(el, CT::Obj(_)) => {
+                let cmp = if el == CT::Str { "ioc_streq(ioc_l->d[ioc_k], ioc_v)" } else { "ioc_l->d[ioc_k] == ioc_v" };
+                Some((
+                    format!("({{ ioc_c{ci} *ioc_l = {r}; {ec} ioc_v = {x}; bool ioc_f = false; for (int32_t ioc_k = 0; ioc_k < ioc_l->n; ioc_k++) if ({cmp}) {{ ioc_f = true; break; }} ioc_f; }})", ci = ci, r = r, ec = ec, x = av[0].code, cmp = cmp),
+                    CT::Bool,
+                ))
+            }
+            _ => bad(self),
+        }
+    }
+
     fn user_call(&mut self, ci: usize, name: &str, av: Vec<Arg>, recv: Option<String>, span: Span) -> Option<(String, CT)> {
+        if let Some(el) = self.classes[ci].list_elem {
+            return self.list_call(ci, el, name, av, recv, span);
+        }
         // methods visible on `ci`: its own first, then inherited ones; an override hides the method it replaces
         let mut cands: Vec<(usize, Vec<CT>)> = Vec::new();
         for c in self.chain(ci) {
