@@ -547,3 +547,40 @@ fn generic_method_infers_its_type_from_the_arguments() {
     assert_eq!(code, 0, "{}", err);
     assert_eq!(out, "2 p 1.5\n");
 }
+
+// ---------------------------------------------------------------- v0.0.12: shared<T>
+
+#[test]
+fn shared_object_is_freed_once_after_the_last_handle() {
+    if !have_cc() { return; }
+    let src = std::fs::read_to_string("examples/shared.ioc").unwrap();
+    let (code, out, err) = run_asan(&src);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "Ben 5 hi Ben\nteam Ben\nBen\nBen\nend\nfree Ben\n");
+}
+
+#[test]
+fn shared_object_survives_while_one_handle_is_left() {
+    if !have_cc() { return; }
+    let types = "public class Keep { public a: shared<Res>; public constructor(a: shared<Res>) { this.a = a; } }";
+    let body = "let first = new shared<Res>(5); let k = new Keep(first.clone()); Console.println(\"made\"); { let x = k.a.clone(); Console.println($\"{x.id}\"); } Console.println(\"after\");";
+    let (code, out, err) = run_asan(&top(types, body));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "make 5\nmade\n5\nafter\nfree 5\n");
+}
+
+#[test]
+fn moving_a_shared_handle_into_a_function_does_not_free_the_object_early() {
+    if !have_cc() { return; }
+    let types = "public class Use { public static eat(h: shared<Res>): int { return h.id; } }";
+    let body = "let a = new shared<Res>(8); let n = Use.eat(a.clone()); Console.println($\"{n}\"); Console.println(\"still\"); Console.println($\"{a.id}\");";
+    let (code, out, err) = run_asan(&top(types, body));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, "make 8\n8\nstill\n8\nfree 8\n");
+}
+
+#[test]
+fn method_call_on_a_temporary_object_is_refused_not_leaked() {
+    let e = compile(&top("", "Console.println(new Res(1).id.toString());")).unwrap_err();
+    assert!(e.contains("temporary"), "{}", e);
+}

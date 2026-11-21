@@ -164,6 +164,8 @@ struct Class<'a> {
     is_abstract: bool,
     /// a `List<T>` instance: the element type (the list is generated, not declared)
     list_elem: Option<CT>,
+    /// a `shared<T>` handle: the class it points to
+    shared_of: Option<usize>,
     /// for an instance of a generic class: what each type parameter stands for
     subst: Vec<(String, CT)>,
 }
@@ -334,6 +336,7 @@ impl<'a> Gen<'a> {
             is_interface: decl.kind == TypeKind::Interface,
             is_abstract: decl.modifiers.contains(Modifier::Abstract),
             list_elem: None,
+            shared_of: None,
             subst: subst.clone(),
         });
         self.insts.push((name.to_string(), args, ci));
@@ -406,6 +409,32 @@ impl<'a> Gen<'a> {
         self.file = saved.1;
     }
 
+    /// The generated handle class for `shared<T>` (T is a class).
+    fn shared_class(&mut self, target: usize) -> Option<usize> {
+        if self.classes[target].is_interface || self.classes[target].list_elem.is_some() {
+            return None;
+        }
+        if let Some(i) = self.classes.iter().position(|c| c.shared_of == Some(target)) {
+            return Some(i);
+        }
+        self.classes.push(Class {
+            name: format!("shared<{}>", self.classes[target].name),
+            file: self.file,
+            span: Span::new(1, 1),
+            fields: Vec::new(),
+            ctors: Vec::new(),
+            dtor: None,
+            base: None,
+            ifaces: Vec::new(),
+            is_interface: false,
+            is_abstract: false,
+            list_elem: None,
+            shared_of: Some(target),
+            subst: Vec::new(),
+        });
+        Some(self.classes.len() - 1)
+    }
+
     /// The generated class for `List<elem>` (created the first time it is used).
     fn list_of(&mut self, elem: CT) -> Option<usize> {
         if matches!(elem, CT::Void | CT::StrArr | CT::Ref(_)) {
@@ -426,6 +455,7 @@ impl<'a> Gen<'a> {
             is_interface: false,
             is_abstract: false,
             list_elem: Some(elem),
+            shared_of: None,
             subst: Vec::new(),
         });
         Some(self.classes.len() - 1)
@@ -451,6 +481,10 @@ impl<'a> Gen<'a> {
                     let a = self.type_ct(&args[0])?;
                     let b = self.type_ct(&args[1])?;
                     return self.result_of(a, b).map(CT::Enum);
+                }
+                if args.len() == 1 && last == "shared" {
+                    let Some(CT::Obj(t)) = self.type_ct(&args[0]) else { return None };
+                    return self.shared_class(t).map(CT::Obj);
                 }
                 if args.len() == 1 && last == "List" {
                     let e = self.type_ct(&args[0])?;
@@ -513,6 +547,10 @@ impl<'a> Gen<'a> {
                     let a = self.info_ct(&args[0])?;
                     let b = self.info_ct(&args[1])?;
                     self.result_of(a, b).map(CT::Enum)
+                }
+                ("shared", 1) => {
+                    let Some(CT::Obj(t)) = self.info_ct(&args[0]) else { return None };
+                    self.shared_class(t).map(CT::Obj)
                 }
                 ("List", 1) => {
                     let e = self.info_ct(&args[0])?;
@@ -706,7 +744,7 @@ impl<'a> Gen<'a> {
     fn unsupported(&mut self, span: Span, what: &str) {
         self.errors.push(CError {
             file: self.file,
-            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.11)", what), span)
+            diag: Diagnostic::new(format!("{} is not supported by the C backend yet (v0.0.12)", what), span)
                 .with_hint("`ioc check` still validates it; code generation for it arrives in the next versions"),
         });
     }
@@ -771,6 +809,7 @@ impl<'a> Gen<'a> {
                 is_interface: t.kind == TypeKind::Interface,
                 is_abstract: t.modifiers.contains(Modifier::Abstract),
                 list_elem: None,
+                shared_of: None,
                 subst: Vec::new(),
             });
         }
@@ -1006,6 +1045,9 @@ impl<'a> Gen<'a> {
             match c.base {
                 Some(b) => s.push_str(&format!("    ioc_c{} b_;\n", b)),
                 None => s.push_str("    int ioc_cls;\n"),
+            }
+            if let Some(t) = c.shared_of {
+                s.push_str(&format!("    ioc_c{}* p;\n    int32_t* rc;\n", t));
             }
             if let Some(e) = c.list_elem {
                 s.push_str(&format!("    {}* d;\n    int32_t n;\n    int32_t cap;\n", e.c()));
@@ -1300,6 +1342,12 @@ impl<'a> Gen<'a> {
                 .collect();
             for (n, j) in owned {
                 self.line(&format!("ioc_drop_{}(v_this->f_{});", j, n));
+            }
+            if let Some(t) = self.classes[ci].shared_of {
+                self.line("if (__atomic_sub_fetch(v_this->rc, 1, __ATOMIC_ACQ_REL) == 0) {");
+                self.line(&format!("    ioc_drop_{}(v_this->p);", t));
+                self.line("    free(v_this->rc);");
+                self.line("}");
             }
             if let Some(e) = self.classes[ci].list_elem {
                 if let CT::Obj(j) = e {
@@ -1750,6 +1798,9 @@ impl<'a> Gen<'a> {
 
     /// Field (or property) `name` of class `ci`, read through `obj`.
     fn field_of(&mut self, obj: String, ci: usize, name: &str, span: Span) -> Option<(String, CT)> {
+        if let Some(t) = self.classes[ci].shared_of {
+            return self.field_of(format!("(({})->p)", obj), t, name, span);
+        }
         if self.classes[ci].list_elem.is_some() && name == "count" {
             return Some((format!("((int32_t)({})->n)", obj), CT::I32));
         }
@@ -1845,6 +1896,10 @@ impl<'a> Gen<'a> {
                     }
                 }
                 let (c, t) = self.expr(target)?;
+                if matches!(t, CT::Obj(_)) && matches!(target.kind, ExprKind::New { .. } | ExprKind::Call { .. }) {
+                    self.unsupported(target.span, "reading a member of a temporary object (store it in a variable first)");
+                    return None;
+                }
                 match (t, name.as_str()) {
                     (CT::Str, "length") => Some((format!("ioc_strlen({})", c), CT::I32)),
                     (CT::StrArr, "length") => Some((format!("((int32_t)({}).length)", c), CT::I32)),
@@ -2120,6 +2175,10 @@ impl<'a> Gen<'a> {
                     return self.base_method_call(name, av, span);
                 }
                 let (tc, tt) = self.expr(target)?;
+                if matches!(tt, CT::Obj(_)) && matches!(target.kind, ExprKind::New { .. } | ExprKind::Call { .. }) {
+                    self.unsupported(target.span, "calling a method on a temporary object (store it in a variable first)");
+                    return None;
+                }
                 match tt {
                     CT::Obj(ci) | CT::Ref(ci) => self.user_call(ci, name, av, Some(tc), span),
                     _ => self.value_method(tc, tt, name, av, span),
@@ -2238,6 +2297,19 @@ impl<'a> Gen<'a> {
     }
 
     fn user_call(&mut self, ci: usize, name: &str, av: Vec<Arg>, recv: Option<String>, span: Span) -> Option<(String, CT)> {
+        if let Some(t) = self.classes[ci].shared_of {
+            let Some(r) = recv else {
+                self.err(span, "a method of `shared<T>` needs an object");
+                return None;
+            };
+            if name == "clone" && av.is_empty() {
+                return Some((
+                    format!("({{ ioc_c{ci} *ioc_o = {r}; ioc_c{ci} *ioc_h = (ioc_c{ci} *)ioc_zalloc(sizeof(ioc_c{ci})); IOC_CLS(ioc_h) = {ci}; ioc_h->p = ioc_o->p; ioc_h->rc = ioc_o->rc; __atomic_add_fetch(ioc_h->rc, 1, __ATOMIC_RELAXED); ioc_h; }})", ci = ci, r = r),
+                    CT::Obj(ci),
+                ));
+            }
+            return self.user_call(t, name, av, Some(format!("(({})->p)", r)), span);
+        }
         if let Some(el) = self.classes[ci].list_elem {
             return self.list_call(ci, el, name, av, recv, span);
         }
@@ -2313,6 +2385,17 @@ impl<'a> Gen<'a> {
             self.unsupported(span, "`new` of this type");
             return None;
         };
+        if let Some(t) = self.classes[ci].shared_of {
+            let (inner, _) = self.construct(t, av, span)?;
+            return Some((
+                format!("({{ ioc_c{ci} *ioc_h = (ioc_c{ci} *)ioc_zalloc(sizeof(ioc_c{ci})); IOC_CLS(ioc_h) = {ci}; ioc_h->p = {inner}; ioc_h->rc = (int32_t *)ioc_zalloc(sizeof(int32_t)); *ioc_h->rc = 1; ioc_h; }})", ci = ci, inner = inner),
+                CT::Obj(ci),
+            ));
+        }
+        self.construct(ci, av, span)
+    }
+
+    fn construct(&mut self, ci: usize, av: Vec<Arg>, span: Span) -> Option<(String, CT)> {
         if !self.concrete(ci) {
             self.err(span, "cannot create an object of an abstract class or an interface");
             return None;

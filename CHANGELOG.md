@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.0.12-alpha (Step 12): shared<T>
+
+- **`shared<T>`**: opt-in shared ownership. `new shared<Player>("Ben")` builds the object and a handle to it; `h.clone()` makes another handle (cheap, bumps a count). Members are reached straight through the handle (`h.name`, `h.hello()`), read-only as the checker requires.
+- The object is freed once, when the **last** handle goes away; each handle is an ordinary owned value (moves, scope end, fields, `List<shared<T>>` all work). The count is atomic, ready for tasks.
+- Checked under AddressSanitizer: single free, survives while one handle is left, handle passed into a function.
+- **New refusal**: calling a method on, or reading a member of, a *temporary* object (`new Res(1).id`) is a clear error ("store it in a variable first"). Before, such temporaries would have leaked.
+- New example: `examples/shared.ioc`. The generated runtime header no longer carries a stale version number.
+
+Next (v0.1.0): `spawn` and `Channel<T>`, which is what `hello.ioc` still needs to build.
+
 ## v0.0.11-alpha (Step 11): generic classes and methods
 
 - **Generic classes**: `class Box<T>`, `class Pair<A, B>`, `class Stack<T>` holding a `List<T>`. Each set of type arguments gets its own compiled copy (no runtime cost, no boxing), made the first time it is used.
