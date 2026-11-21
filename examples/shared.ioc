@@ -1,0 +1,38 @@
+// Iocaste v0.0.12-alpha: shared<T>, reference-counted shared ownership.
+//   ioc run examples/shared.ioc
+namespace T;
+import Ioc.Console;
+import Ioc.Collections;
+
+public class Player {
+    public name: string;
+    public score: int;
+    public constructor(name: string) { this.name = name; this.score = 5; }
+    public hello(): string => $"hi {name}";
+    destructor() { Console.println($"free {name}"); }
+}
+
+public class Team {
+    public lead: shared<Player>;
+    public constructor(p: shared<Player>) { this.lead = p; }
+}
+
+public class Program {
+    static show(p: ref shared<Player>): void {
+        Console.println($"{p.name} {p.score} {p.hello()}");
+    }
+
+    public static main(args: string[]): int {
+        let a = new shared<Player>("Ben");
+        let b = a.clone();
+        show(ref b);
+        let t = new Team(a.clone());
+        Console.println($"team {t.lead.name}");
+        let all = new List<shared<Player>>();
+        all.add(b);
+        all.add(t.lead.clone());
+        for (let p in all) { Console.println(p.name); }
+        Console.println("end");
+        return 0;
+    }
+}

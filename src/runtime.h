@@ -1,4 +1,4 @@
-/* Iocaste runtime v0.0.8-alpha (generated programs include this text verbatim) */
+/* Iocaste runtime (generated programs include this text verbatim) */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>

@@ -88,7 +88,7 @@ COMMANDS:
 
 `ioc help <command>` explains one command.
 
-Coming next: `shared<T>`, tasks and channels (v0.1.0)."
+Coming next: tasks (`spawn`) and channels (v0.1.0)."
     );
 }
 
